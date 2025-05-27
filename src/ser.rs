@@ -469,8 +469,9 @@ mod tests {
     #[test]
     fn test_map() {
         let mut hash_map = std::collections::HashMap::new();
+        // Note that iteration order is not guaranteed to match insertion order,
+        // so inserting multiple values leads to non-deterministic output.
         hash_map.insert((1, 2), 3);
-        hash_map.insert((4, 5), 6);
-        assert_snapshot!(to_sexp(&hash_map).unwrap(), @"[[[1, 2], 3], [[4, 5], 6]]");
+        assert_snapshot!(to_sexp(&hash_map).unwrap(), @"[[[1, 2], 3]]");
     }
 }
