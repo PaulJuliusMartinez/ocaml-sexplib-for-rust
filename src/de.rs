@@ -124,9 +124,13 @@ impl<'a: 'de, 'de> Deserializer<'a, 'de> {
         sexps.len()
     }
 
-    fn have_more_elems_to_process(&self) -> bool {
+    fn num_remaining_elems_to_process(&self) -> usize {
         let (sexps, index) = self.cursor.last().unwrap();
-        *index < sexps.len()
+        sexps.len() - *index
+    }
+
+    fn have_more_elems_to_process(&self) -> bool {
+        self.num_remaining_elems_to_process() > 0
     }
 }
 
@@ -165,11 +169,16 @@ macro_rules! impl_deserialize_float {
 impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'a, 'de> {
     type Error = Error;
 
-    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("Sexp format is not self-describing")
+        let cursor = self.cursor.last_mut().unwrap();
+        match cursor.0.get(cursor.1) {
+            None => error("exhaused current input"),
+            Some(Sexp::Atom(_)) => self.deserialize_str(visitor),
+            Some(Sexp::List(_)) => self.deserialize_seq(visitor),
+        }
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -362,12 +371,12 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
         self,
         _name: &'static str,
         _fields: &'static [&'static str],
-        _visitor: V,
+        visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("`deserialize_struct` not implemented yet")
+        self.deserialize_map(visitor)
     }
 
     fn deserialize_enum<V>(
@@ -382,18 +391,18 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
         error("`deserialize_enum` not implemented yet")
     }
 
-    fn deserialize_identifier<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("`deserialize_identifier` not implemented yet")
+        self.deserialize_str(visitor)
     }
 
-    fn deserialize_ignored_any<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("`deserialize_ignored_any` not implemented yet")
+        self.deserialize_any(visitor)
     }
 }
 
@@ -409,6 +418,10 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> SeqAccess<'de> for SeqDeserializer<'a, 'de, 'b> 
         } else {
             Ok(None)
         }
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.0.num_remaining_elems_to_process())
     }
 }
 
@@ -439,6 +452,10 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> MapAccess<'de> for MapDeserializer<'a, 'de, 'b> 
             self.0.step_out_of_list();
         }
         result
+    }
+
+    fn size_hint(&self) -> Option<usize> {
+        Some(self.0.num_remaining_elems_to_process())
     }
 }
 
@@ -695,5 +712,106 @@ mod tests {
             "Expected two-element list for key-value-pair",
         )
         "#);
+    }
+
+    #[test]
+    fn test_struct() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct Struct {
+            x: i32,
+            y: bool,
+        }
+
+        let sexp = l(vec![
+            a("start"),
+            l(vec![l(vec![a("x"), a("1")]), l(vec![a("y"), a("true")])]),
+            a("end"),
+        ]);
+
+        assert_eq!(
+            ("start", Struct { x: 1, y: true }, "end"),
+            from_sexp::<(&str, Struct, &str)>(&sexp).unwrap(),
+        );
+
+        let atom_kvp = l(vec![a("key: value")]);
+        let unit_kvp = l(vec![l(vec![])]);
+        let one_element_kvp = l(vec![l(vec![a("x")])]);
+        let unknown_one_element_kvp = l(vec![l(vec![a("z")])]);
+        let three_element_kvp = l(vec![l(vec![a("x"), a("1"), a("true")])]);
+
+        assert_debug_snapshot!(from_sexp::<Struct>(&atom_kvp), @r#"
+        Err(
+            DeserializationError(
+                "expected list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Struct>(&unit_kvp), @r#"
+        Err(
+            DeserializationError(
+                "Expected two-element list for key-value-pair",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Struct>(&one_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "Expected two-element list for key-value-pair",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Struct>(&unknown_one_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "Expected two-element list for key-value-pair",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Struct>(&three_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "Expected two-element list for key-value-pair",
+            ),
+        )
+        "#);
+
+        // Mostly testing serde's internals here.
+
+        // Missing keys
+        assert_debug_snapshot!(from_sexp::<Struct>(&l(vec![])), @r#"
+        Err(
+            DeserializationError(
+                "missing field `x`",
+            ),
+        )
+        "#);
+
+        // Duplicate key
+        assert_debug_snapshot!(from_sexp::<Struct>(&l(vec![l(vec![a("x"), a("1")]), l(vec![a("x"), a("1")])])), @r#"
+        Err(
+            DeserializationError(
+                "duplicate field `x`",
+            ),
+        )
+        "#);
+
+        // Extra_key is ignored
+        let sexp = l(vec![
+            l(vec![a("x"), a("1")]),
+            l(vec![a("y"), a("true")]),
+            l(vec![a("z"), a("0")]),
+        ]);
+        assert_debug_snapshot!(from_sexp::<Struct>(&sexp), @r"
+        Ok(
+            Struct {
+                x: 1,
+                y: true,
+            },
+        )
+        ");
     }
 }
