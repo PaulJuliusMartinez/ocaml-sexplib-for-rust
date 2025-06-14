@@ -43,6 +43,7 @@ pub struct Deserializer<'a: 'de, 'de> {
 // 'b: Lifetime of the reference to the Deserializer<'a, 'de>
 pub struct SeqDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 'de>);
 pub struct MapDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 'de>);
+pub struct EnumDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 'de>);
 
 impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     pub fn from_sexp(sexp: &'de Sexp<'a>) -> Self {
@@ -116,6 +117,17 @@ impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     }
 
     fn finish_deserializing_map(&mut self) {
+        self.step_out_of_list();
+    }
+
+    fn start_deserializing_non_unit_enum<'b>(
+        &'b mut self,
+    ) -> Result<EnumDeserializer<'a, 'de, 'b>> {
+        self.step_into_list()?;
+        Ok(EnumDeserializer(self))
+    }
+
+    fn finish_deserializing_non_unit_enum(&mut self) {
         self.step_out_of_list();
     }
 
@@ -383,12 +395,32 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
         self,
         _name: &'static str,
         _variants: &'static [&'static str],
-        _visitor: V,
+        visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("`deserialize_enum` not implemented yet")
+        let cursor = self.cursor.last_mut().unwrap();
+        match cursor.0.get(cursor.1) {
+            None => error("exhausted current input"),
+            Some(Sexp::Atom(atom)) => {
+                // `IntoDeserializer` is implemented for `&str` and returns a
+                // `StrDeserializer`, which implements a special `EnumAccess`
+                // that only knows how to handle unit variants.
+                cursor.1 += 1;
+                visitor.visit_enum(atom.as_ref().into_deserializer())
+            }
+            Some(Sexp::List(_)) => {
+                let enum_access = self.start_deserializing_non_unit_enum()?;
+                match visitor.visit_enum(enum_access) {
+                    Ok(value) => {
+                        self.finish_deserializing_non_unit_enum();
+                        Ok(value)
+                    }
+                    Err(err) => Err(err),
+                }
+            }
+        }
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
@@ -456,6 +488,64 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> MapAccess<'de> for MapDeserializer<'a, 'de, 'b> 
 
     fn size_hint(&self) -> Option<usize> {
         Some(self.0.num_remaining_elems_to_process())
+    }
+}
+
+impl<'a: 'de + 'b, 'de: 'b, 'b> EnumAccess<'de> for EnumDeserializer<'a, 'de, 'b> {
+    type Error = Error;
+    type Variant = Self;
+
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let val = seed.deserialize(&mut *self.0)?;
+        Ok((val, self))
+    }
+}
+
+impl<'a: 'de + 'b, 'de: 'b, 'b> VariantAccess<'de> for EnumDeserializer<'a, 'de, 'b> {
+    type Error = Error;
+
+    fn unit_variant(self) -> Result<()> {
+        error("`EnumDeserializer::unit_variant` not implemented yet")
+    }
+
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
+    where
+        T: DeserializeSeed<'de>,
+    {
+        let curr_list_len = self.0.curr_list_len();
+        if curr_list_len != 2 {
+            error_string(format!(
+                "expected list of length 2 for newtype variant; got length {curr_list_len}"
+            ))
+        } else {
+            seed.deserialize(&mut *self.0)
+        }
+    }
+
+    fn tuple_variant<V>(self, len: usize, visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let curr_list_len = self.0.curr_list_len();
+        if curr_list_len != 1 + len {
+            error_string(format!(
+                "expected list of length {len} for tuple variant; got length {curr_list_len}"
+            ))
+        } else {
+            let seq_access = SeqDeserializer(self.0);
+            visitor.visit_seq(seq_access)
+        }
+    }
+
+    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
+    where
+        V: Visitor<'de>,
+    {
+        let map_access = MapDeserializer(self.0);
+        visitor.visit_map(map_access)
     }
 }
 
@@ -813,5 +903,108 @@ mod tests {
             },
         )
         ");
+    }
+
+    #[test]
+    fn test_variant() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        enum Variant {
+            Unit,
+            Newtype(i32),
+            Tuple(i32, i32),
+            Struct { x: i32 },
+        }
+
+        // Check Unit
+
+        let unit_sexp = l(vec![a("start"), a("Unit"), a("end")]);
+
+        assert_eq!(
+            Ok(("start", Variant::Unit, "end")),
+            from_sexp::<(&str, Variant, &str)>(&unit_sexp),
+        );
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&a("Newtype")), @r#"
+        Err(
+            DeserializationError(
+                "invalid type: unit variant, expected newtype variant",
+            ),
+        )
+        "#);
+
+        // Check Newtype
+
+        let newtype_sexp = l(vec![a("start"), l(vec![a("Newtype"), a("1")]), a("end")]);
+
+        assert_eq!(
+            Ok(("start", Variant::Newtype(1), "end")),
+            from_sexp::<(&str, Variant, &str)>(&newtype_sexp),
+        );
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Newtype")])), @r#"
+        Err(
+            DeserializationError(
+                "expected list of length 2 for newtype variant; got length 1",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Newtype"), a("1"), a("2")])), @r#"
+        Err(
+            DeserializationError(
+                "expected list of length 2 for newtype variant; got length 3",
+            ),
+        )
+        "#);
+
+        // Check Tuple
+
+        let tuple_sexp = l(vec![
+            a("start"),
+            l(vec![a("Tuple"), a("1"), a("2")]),
+            a("end"),
+        ]);
+
+        assert_eq!(
+            Ok(("start", Variant::Tuple(1, 2), "end")),
+            from_sexp::<(&str, Variant, &str)>(&tuple_sexp),
+        );
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Tuple"), a("1")])), @r#"
+        Err(
+            DeserializationError(
+                "expected list of length 2 for tuple variant; got length 2",
+            ),
+        )
+        "#);
+
+        // Check Struct
+
+        let struct_sexp = l(vec![
+            a("start"),
+            l(vec![a("Struct"), l(vec![a("x"), a("1")])]),
+            a("end"),
+        ]);
+
+        assert_eq!(
+            Ok(("start", Variant::Struct { x: 1 }, "end")),
+            from_sexp::<(&str, Variant, &str)>(&struct_sexp),
+        );
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Struct"), a("1")])), @r#"
+        Err(
+            DeserializationError(
+                "expected list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Struct"), l(vec![a("x"), a("1"), a("bad")])])), @r#"
+        Err(
+            DeserializationError(
+                "Expected two-element list for key-value-pair",
+            ),
+        )
+        "#);
     }
 }
