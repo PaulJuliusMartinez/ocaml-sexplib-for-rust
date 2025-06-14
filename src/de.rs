@@ -27,6 +27,8 @@ fn parse_float_error(err: ParseFloatError) -> Error {
     Error::DeserializationError(format!("unable to parse float: {:#?}", err))
 }
 
+// 'a: Lifetime of the data in the Sexp<'a>
+// 'de: Lifetime of the thing that is deserializing the Sexp<'a>
 #[derive(Debug)]
 pub struct Deserializer<'a: 'de, 'de> {
     input_sexp: &'de Sexp<'a>,
@@ -36,7 +38,11 @@ pub struct Deserializer<'a: 'de, 'de> {
 // Someday: This should just be `{ sexps: &'de [Sexp<'a>}, index: usize }` maybe,
 // rather than relying on `cursor` always pointing to the correct thing when functions
 // are called on this.
+// 'a: Lifetime of the data in the Sexp<'a>
+// 'de: Lifetime of the thing that is deserializing the Sexp<'a>
+// 'b: Lifetime of the reference to the Deserializer<'a, 'de>
 pub struct SeqDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 'de>);
+pub struct MapDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 'de>);
 
 impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     pub fn from_sexp(sexp: &'de Sexp<'a>) -> Self {
@@ -98,6 +104,19 @@ impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     fn start_deserializing_seq<'b>(&'b mut self) -> Result<SeqDeserializer<'a, 'de, 'b>> {
         self.step_into_list()?;
         Ok(SeqDeserializer(self))
+    }
+
+    fn finish_deserializing_seq(&mut self) {
+        self.step_out_of_list();
+    }
+
+    fn start_deserializing_map<'b>(&'b mut self) -> Result<MapDeserializer<'a, 'de, 'b>> {
+        self.step_into_list()?;
+        Ok(MapDeserializer(self))
+    }
+
+    fn finish_deserializing_map(&mut self) {
+        self.step_out_of_list();
     }
 
     fn curr_list_len(&self) -> usize {
@@ -275,9 +294,15 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
         V: Visitor<'de>,
     {
         let seq_access = self.start_deserializing_seq()?;
-        let value = visitor.visit_seq(seq_access)?;
-        // Someday: Make sure we've processed all of the elements?
-        Ok(value)
+        match visitor.visit_seq(seq_access) {
+            Ok(value) => {
+                // Someday: Make sure we've processed all of the elements?
+                // Or is this guaranteed by impl of `SeqDeserializer`?
+                self.finish_deserializing_seq();
+                Ok(value)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn deserialize_tuple<V>(self, len: usize, visitor: V) -> Result<V::Value>
@@ -293,10 +318,15 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
                 "Expected list of length {len} for tuple, but got list of length {curr_list_len}"
             ))
         } else {
-            let value = visitor.visit_seq(seq_access)?;
-            // Someday: Make sure we've processed all of the elements?
-            // Do we still need to do this with the `curr_list_len` check?
-            Ok(value)
+            match visitor.visit_seq(seq_access) {
+                Ok(value) => {
+                    // Someday: Make sure we've processed all of the elements?
+                    // Or is this guaranteed by impl of `SeqDeserializer`?
+                    self.finish_deserializing_seq();
+                    Ok(value)
+                }
+                Err(err) => Err(err),
+            }
         }
     }
 
@@ -312,11 +342,20 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> de::Deserializer<'de> for &'b mut Deserializer<'
         self.deserialize_tuple(len, visitor)
     }
 
-    fn deserialize_map<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        error("`deserialize_map` not implemented yet")
+        let map_access = self.start_deserializing_map()?;
+        match visitor.visit_map(map_access) {
+            Ok(value) => {
+                // Someday: Make sure we've processed all of the elements?
+                // Or is this guaranteed by impl of `MapDeserializer`?
+                self.finish_deserializing_map();
+                Ok(value)
+            }
+            Err(err) => Err(err),
+        }
     }
 
     fn deserialize_struct<V>(
@@ -370,6 +409,36 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> SeqAccess<'de> for SeqDeserializer<'a, 'de, 'b> 
         } else {
             Ok(None)
         }
+    }
+}
+
+impl<'a: 'de + 'b, 'de: 'b, 'b> MapAccess<'de> for MapDeserializer<'a, 'de, 'b> {
+    type Error = Error;
+
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
+    where
+        K: DeserializeSeed<'de>,
+    {
+        if self.0.have_more_elems_to_process() {
+            self.0.step_into_list()?;
+            match self.0.curr_list_len() {
+                2 => seed.deserialize(&mut *self.0).map(Some),
+                _ => error("Expected two-element list for key-value-pair"),
+            }
+        } else {
+            Ok(None)
+        }
+    }
+
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
+    where
+        V: DeserializeSeed<'de>,
+    {
+        let result = seed.deserialize(&mut *self.0);
+        if result.is_ok() {
+            self.0.step_out_of_list();
+        }
+        result
     }
 }
 
@@ -544,15 +613,17 @@ mod tests {
     #[test]
     fn test_tuple_and_tuple_struct() {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
-        struct TupleStruct<'a>(i8, bool, &'a str);
+        struct TupleStruct<'a>(i8, (bool, i8), &'a str);
+
+        let sexp = l(vec![a("1"), l(vec![a("true"), a("2")]), a("abc")]);
 
         assert_eq!(
-            (1, true, "abc"),
-            from_sexp::<(i8, bool, &str)>(&l(vec![a("1"), a("true"), a("abc")])).unwrap(),
+            (1, (true, 2), "abc"),
+            from_sexp::<(i8, (bool, i8), &str)>(&sexp).unwrap(),
         );
         assert_eq!(
-            TupleStruct(1, true, "abc"),
-            from_sexp::<TupleStruct>(&l(vec![a("1"), a("true"), a("abc")])).unwrap(),
+            TupleStruct(1, (true, 2), "abc"),
+            from_sexp::<TupleStruct>(&sexp).unwrap(),
         );
 
         assert_debug_snapshot!(from_sexp::<(i8, bool, String)>(&l(vec![a("0"), a("false")])), @r#"
@@ -568,6 +639,60 @@ mod tests {
             DeserializationError(
                 "Expected list of length 3 for tuple, but got list of length 2",
             ),
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_map() {
+        use std::collections::BTreeMap;
+
+        let test = l(vec![
+            l(vec![l(vec![a("1"), a("foo")]), l(vec![a("2"), a("two")])]),
+            a("true"),
+        ]);
+
+        assert_debug_snapshot!(from_sexp::<(BTreeMap<i32, &str>, bool)>(&test).unwrap(), @r#"
+        (
+            {
+                1: "foo",
+                2: "two",
+            },
+            true,
+        )
+        "#);
+
+        fn f(sexp: &Sexp) -> Result<BTreeMap<i32, i32>> {
+            from_sexp::<BTreeMap<i32, i32>>(sexp)
+        }
+
+        assert_debug_snapshot!(f(&l(vec![])).unwrap(), @r#"{}"#);
+
+        let atom_kvp = l(vec![a("1")]);
+        assert_debug_snapshot!(f(&atom_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "expected list",
+        )
+        "#);
+
+        let unit_kvp = l(vec![l(vec![])]);
+        assert_debug_snapshot!(f(&unit_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "Expected two-element list for key-value-pair",
+        )
+        "#);
+
+        let one_element_kvp = l(vec![l(vec![a("1")])]);
+        assert_debug_snapshot!(f(&one_element_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "Expected two-element list for key-value-pair",
+        )
+        "#);
+
+        let three_element_kvp = l(vec![l(vec![a("1"), a("2"), a("3")])]);
+        assert_debug_snapshot!(f(&three_element_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "Expected two-element list for key-value-pair",
         )
         "#);
     }
