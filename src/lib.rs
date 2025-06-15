@@ -15,4 +15,6 @@ pub use sexp::Sexp;
 
 pub use de::{from_sexp, Deserializer};
 pub use error::{Error, Result};
-pub use ser::{to_sexp, Serializer};
+pub use ser::{
+    to_sexp, to_string, to_string_mach, to_writer, to_writer_mach, Serializer, SexpSerializer,
+};

@@ -113,6 +113,11 @@ impl<W: io::Write> TokenWriter<W> {
             Writer::Machine(ref mut writer) => writer.end_list(&mut self.w),
         }
     }
+
+    pub fn write_unit(&mut self) -> io::Result<()> {
+        self.start_list()?;
+        self.end_list()
+    }
 }
 
 #[cfg(test)]

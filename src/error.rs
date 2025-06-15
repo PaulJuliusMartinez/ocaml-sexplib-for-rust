@@ -9,6 +9,13 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     SerializationError(String),
     DeserializationError(String),
+    Io(std::io::Error),
+}
+
+impl Error {
+    pub fn io(io_err: std::io::Error) -> Error {
+        Error::Io(io_err)
+    }
 }
 
 impl ser::Error for Error {
@@ -28,6 +35,7 @@ impl Display for Error {
         match self {
             Error::SerializationError(msg) => formatter.write_str(msg),
             Error::DeserializationError(msg) => formatter.write_str(msg),
+            Error::Io(io_err) => write!(formatter, "{}", io_err),
         }
     }
 }
