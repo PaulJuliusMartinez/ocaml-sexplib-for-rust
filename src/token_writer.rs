@@ -14,7 +14,7 @@ impl StandardWriter {
         }
     }
 
-    fn start_list<W: io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+    fn start_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         if !self.just_started_new_list {
             write!(w, "{}", ' ')?;
         }
@@ -22,7 +22,7 @@ impl StandardWriter {
         write!(w, "{}", '(')
     }
 
-    fn write_atom<W: io::Write>(&mut self, w: &mut W, atom: Atom) -> io::Result<()> {
+    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
         if !self.just_started_new_list {
             write!(w, "{}", ' ')?;
         }
@@ -30,7 +30,7 @@ impl StandardWriter {
         atom.write(w)
     }
 
-    fn end_list<W: io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+    fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.just_started_new_list = false;
         write!(w, "{}", ')')
     }
@@ -47,12 +47,12 @@ impl MachineWriter {
         }
     }
 
-    fn start_list<W: io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+    fn start_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.need_space_before_next_unquoted_atom = false;
         write!(w, "{}", '(')
     }
 
-    fn write_atom<W: io::Write>(&mut self, w: &mut W, atom: Atom) -> io::Result<()> {
+    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
         let is_unquoted = !atom.needs_to_be_quoted();
         if self.need_space_before_next_unquoted_atom && is_unquoted {
             write!(w, "{}", ' ')?;
@@ -61,7 +61,7 @@ impl MachineWriter {
         atom.write(w)
     }
 
-    fn end_list<W: io::Write>(&mut self, w: &mut W) -> io::Result<()> {
+    fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.need_space_before_next_unquoted_atom = false;
         write!(w, "{}", ')')
     }
@@ -72,8 +72,8 @@ enum Writer {
     Machine(MachineWriter),
 }
 
-pub struct TokenWriter<'a, W> {
-    w: &'a mut W,
+pub struct TokenWriter<W> {
+    w: W,
     writer: Writer,
 }
 
@@ -82,8 +82,8 @@ pub enum Style {
     Machine,
 }
 
-impl<'a, W: io::Write> TokenWriter<'a, W> {
-    pub fn new(w: &mut W, style: Style) -> TokenWriter<'_, W> {
+impl<W: io::Write> TokenWriter<W> {
+    pub fn new(w: W, style: Style) -> TokenWriter<W> {
         let writer = match style {
             Style::Standard => Writer::Standard(StandardWriter::new()),
             Style::Machine => Writer::Machine(MachineWriter::new()),
@@ -94,23 +94,23 @@ impl<'a, W: io::Write> TokenWriter<'a, W> {
 
     pub fn start_list(&mut self) -> io::Result<()> {
         match self.writer {
-            Writer::Standard(ref mut writer) => writer.start_list(self.w),
-            Writer::Machine(ref mut writer) => writer.start_list(self.w),
+            Writer::Standard(ref mut writer) => writer.start_list(&mut self.w),
+            Writer::Machine(ref mut writer) => writer.start_list(&mut self.w),
         }
     }
 
     pub fn write_atom(&mut self, s: &str) -> io::Result<()> {
         let atom = Atom::new(s);
         match self.writer {
-            Writer::Standard(ref mut writer) => writer.write_atom(self.w, atom),
-            Writer::Machine(ref mut writer) => writer.write_atom(self.w, atom),
+            Writer::Standard(ref mut writer) => writer.write_atom(&mut self.w, atom),
+            Writer::Machine(ref mut writer) => writer.write_atom(&mut self.w, atom),
         }
     }
 
     pub fn end_list(&mut self) -> io::Result<()> {
         match self.writer {
-            Writer::Standard(ref mut writer) => writer.end_list(self.w),
-            Writer::Machine(ref mut writer) => writer.end_list(self.w),
+            Writer::Standard(ref mut writer) => writer.end_list(&mut self.w),
+            Writer::Machine(ref mut writer) => writer.end_list(&mut self.w),
         }
     }
 }
@@ -123,7 +123,7 @@ mod tests {
 
     fn with_style<F>(style: Style, f: F) -> io::Result<String>
     where
-        F: FnOnce(&mut TokenWriter<Vec<u8>>) -> io::Result<()>,
+        F: FnOnce(&mut TokenWriter<&mut Vec<u8>>) -> io::Result<()>,
     {
         let mut v = Vec::new();
         let mut w = TokenWriter::new(&mut v, style);
