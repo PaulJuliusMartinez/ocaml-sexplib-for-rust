@@ -4,10 +4,12 @@
 // Sometimes "x >= y + 1" is semantically clearer than "x > y"
 #![allow(clippy::int_plus_one)]
 
+mod atom;
 mod de;
 mod error;
 mod ser;
 mod sexp;
+mod token_writer;
 
 pub use sexp::Sexp;
 
