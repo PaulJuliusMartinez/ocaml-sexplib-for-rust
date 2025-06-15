@@ -920,8 +920,8 @@ mod tests {
         let unit_sexp = l(vec![a("start"), a("Unit"), a("end")]);
 
         assert_eq!(
-            Ok(("start", Variant::Unit, "end")),
-            from_sexp::<(&str, Variant, &str)>(&unit_sexp),
+            ("start", Variant::Unit, "end"),
+            from_sexp::<(&str, Variant, &str)>(&unit_sexp).unwrap(),
         );
 
         assert_debug_snapshot!(from_sexp::<Variant>(&a("Newtype")), @r#"
@@ -937,8 +937,8 @@ mod tests {
         let newtype_sexp = l(vec![a("start"), l(vec![a("Newtype"), a("1")]), a("end")]);
 
         assert_eq!(
-            Ok(("start", Variant::Newtype(1), "end")),
-            from_sexp::<(&str, Variant, &str)>(&newtype_sexp),
+            ("start", Variant::Newtype(1), "end"),
+            from_sexp::<(&str, Variant, &str)>(&newtype_sexp).unwrap(),
         );
 
         assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Newtype")])), @r#"
@@ -966,8 +966,8 @@ mod tests {
         ]);
 
         assert_eq!(
-            Ok(("start", Variant::Tuple(1, 2), "end")),
-            from_sexp::<(&str, Variant, &str)>(&tuple_sexp),
+            ("start", Variant::Tuple(1, 2), "end"),
+            from_sexp::<(&str, Variant, &str)>(&tuple_sexp).unwrap(),
         );
 
         assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Tuple"), a("1")])), @r#"
@@ -987,8 +987,8 @@ mod tests {
         ]);
 
         assert_eq!(
-            Ok(("start", Variant::Struct { x: 1 }, "end")),
-            from_sexp::<(&str, Variant, &str)>(&struct_sexp),
+            ("start", Variant::Struct { x: 1 }, "end"),
+            from_sexp::<(&str, Variant, &str)>(&struct_sexp).unwrap(),
         );
 
         assert_debug_snapshot!(from_sexp::<Variant>(&l(vec![a("Struct"), a("1")])), @r#"
