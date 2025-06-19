@@ -6,5 +6,6 @@ pub enum Sexp<'a> {
     List(Vec<Sexp<'a>>),
 }
 
+pub mod de;
 pub use crate::error;
 pub mod ser;
