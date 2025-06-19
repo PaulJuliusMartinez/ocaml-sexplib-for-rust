@@ -329,6 +329,7 @@ mod tests {
         }
     }
 
+    #[allow(clippy::approx_constant)]
     #[test]
     fn test_primitives() {
         assert_snapshot!(to_sexp(&true).unwrap(), @"true");

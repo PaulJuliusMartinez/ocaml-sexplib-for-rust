@@ -115,7 +115,7 @@ where
     }
 
     fn serialize_str(self, v: &str) -> Result<()> {
-        self.token_writer.write_atom(&v).map_err(Error::io)
+        self.token_writer.write_atom(v).map_err(Error::io)
     }
 
     fn serialize_char(self, v: char) -> Result<()> {
@@ -320,8 +320,9 @@ impl<'a, W: io::Write> ser::SerializeMap for &'a mut Serializer<W> {
 mod tests {
     use super::*;
 
-    use insta::{assert_debug_snapshot, assert_snapshot};
+    use insta::assert_snapshot;
 
+    #[allow(clippy::approx_constant)]
     #[test]
     fn test_primitives() {
         assert_snapshot!(to_string(&true).unwrap(), @"true");

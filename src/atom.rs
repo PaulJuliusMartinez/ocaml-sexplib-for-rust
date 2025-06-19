@@ -74,9 +74,9 @@ impl<'a> Atom<'a> {
     pub fn write<W: io::Write>(&self, mut w: W) -> io::Result<()> {
         match self {
             Atom::NeedsToBeQuoted(s) => {
-                write!(w, "{}", '"')?;
+                write!(w, "\"")?;
                 write!(w, "{}", s)?;
-                write!(w, "{}", '"')
+                write!(w, "\"")
             }
             Atom::DoesNotNeedToBeQuoted(s) => write!(w, "{}", s),
         }

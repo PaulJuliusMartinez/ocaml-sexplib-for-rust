@@ -16,15 +16,15 @@ impl StandardWriter {
 
     fn start_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         if !self.just_started_new_list {
-            write!(w, "{}", ' ')?;
+            write!(w, " ")?;
         }
         self.just_started_new_list = true;
-        write!(w, "{}", '(')
+        write!(w, "(")
     }
 
     fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
         if !self.just_started_new_list {
-            write!(w, "{}", ' ')?;
+            write!(w, " ")?;
         }
         self.just_started_new_list = false;
         atom.write(w)
@@ -32,7 +32,7 @@ impl StandardWriter {
 
     fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.just_started_new_list = false;
-        write!(w, "{}", ')')
+        write!(w, ")")
     }
 }
 
@@ -49,13 +49,13 @@ impl MachineWriter {
 
     fn start_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.need_space_before_next_unquoted_atom = false;
-        write!(w, "{}", '(')
+        write!(w, "(")
     }
 
     fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
         let is_unquoted = !atom.needs_to_be_quoted();
         if self.need_space_before_next_unquoted_atom && is_unquoted {
-            write!(w, "{}", ' ')?;
+            write!(w, " ")?;
         }
         self.need_space_before_next_unquoted_atom = is_unquoted;
         atom.write(w)
@@ -63,7 +63,7 @@ impl MachineWriter {
 
     fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
         self.need_space_before_next_unquoted_atom = false;
-        write!(w, "{}", ')')
+        write!(w, ")")
     }
 }
 

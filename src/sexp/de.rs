@@ -29,9 +29,7 @@ fn parse_float_error(err: ParseFloatError) -> Error {
 
 // 'a: Lifetime of the data in the Sexp<'a>
 // 'de: Lifetime of the thing that is deserializing the Sexp<'a>
-#[derive(Debug)]
 pub struct Deserializer<'a: 'de, 'de> {
-    input_sexp: &'de Sexp<'a>,
     cursor: Vec<(&'de [Sexp<'a>], usize)>,
 }
 
@@ -48,7 +46,6 @@ pub struct EnumDeserializer<'a: 'de + 'b, 'de: 'b, 'b>(&'b mut Deserializer<'a, 
 impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     pub fn from_sexp(sexp: &'de Sexp<'a>) -> Self {
         Deserializer {
-            input_sexp: sexp,
             cursor: vec![(std::array::from_ref(sexp).as_slice(), 0)],
         }
     }
@@ -88,7 +85,7 @@ impl<'a: 'de, 'de> Deserializer<'a, 'de> {
     fn step_into_list(&mut self) -> Result<()> {
         let cursor = self.cursor.last_mut().unwrap();
         match cursor.0.get(cursor.1) {
-            None => return error("exhaused current input"),
+            None => error("exhaused current input"),
             Some(Sexp::Atom(_)) => error("expected list"),
             Some(Sexp::List(list)) => {
                 cursor.1 += 1;
@@ -563,6 +560,7 @@ mod tests {
         Sexp::List(sexps)
     }
 
+    #[allow(clippy::bool_assert_comparison)]
     #[test]
     fn test_primitives() {
         assert_eq!(true, from_sexp(&a("true")).unwrap());
@@ -634,6 +632,7 @@ mod tests {
         "#);
     }
 
+    #[allow(clippy::unit_cmp)]
     #[test]
     fn test_unit() {
         assert_eq!((), from_sexp::<()>(&l(vec![])).unwrap());
