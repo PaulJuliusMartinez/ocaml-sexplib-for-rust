@@ -5,3 +5,6 @@ pub enum Sexp<'a> {
     Atom(Cow<'a, str>),
     List(Vec<Sexp<'a>>),
 }
+
+pub use crate::error;
+pub mod ser;
