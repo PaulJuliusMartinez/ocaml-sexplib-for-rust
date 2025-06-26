@@ -5,10 +5,12 @@
 #![allow(clippy::int_plus_one)]
 
 mod atom;
+pub mod de;
 pub mod error;
 pub mod ser;
 pub mod sexp;
 mod token_writer;
+pub mod tokenizer;
 
 pub use sexp::Sexp;
 
