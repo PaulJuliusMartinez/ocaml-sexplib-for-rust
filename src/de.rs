@@ -267,30 +267,33 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         visitor.visit_newtype_struct(self)
     }
 
-    fn deserialize_seq<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_seq<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.expect_start_of_list()?;
+        visitor.visit_seq(self)
     }
 
-    fn deserialize_tuple<V>(self, _len: usize, _visitor: V) -> Result<V::Value>
+    fn deserialize_tuple<V>(self, _len: usize, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        let result = self.deserialize_seq(visitor)?;
+        self.expect_end_of_list()?;
+        Ok(result)
     }
 
     fn deserialize_tuple_struct<V>(
         self,
         _name: &'static str,
-        _len: usize,
-        _visitor: V,
+        len: usize,
+        visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.deserialize_tuple(len, visitor)
     }
 
     fn deserialize_map<V>(self, _visitor: V) -> Result<V::Value>
@@ -342,11 +345,21 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
 impl<'de> SeqAccess<'de> for Deserializer {
     type Error = Error;
 
-    fn next_element_seed<T>(&mut self, _seed: T) -> Result<Option<T::Value>>
+    fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
     where
         T: DeserializeSeed<'de>,
     {
-        unimplemented!();
+        match self.peek()? {
+            None => error("reached end of input"),
+            Some(&Token::RightParen) => {
+                self.advance();
+                Ok(None)
+            }
+            Some(&Token::LeftParen | &Token::Atom(_)) => {
+                let value = seed.deserialize(&mut *self)?;
+                Ok(Some(value))
+            }
+        }
     }
 }
 
@@ -413,6 +426,8 @@ impl<'de> VariantAccess<'de> for Deserializer {
 mod tests {
     use super::*;
 
+    use std::borrow::Cow;
+
     use insta::assert_debug_snapshot;
 
     fn a(s: &str) -> Token {
@@ -474,8 +489,8 @@ mod tests {
 
     #[test]
     fn test_strings() {
-        assert_eq!("abc", from_tokens::<&str>(vec![a("abc")]).unwrap());
         assert_eq!("123", from_tokens::<String>(vec![a("123")]).unwrap());
+        assert_eq!("abc", from_tokens::<Cow<str>>(vec![a("abc")]).unwrap());
     }
 
     #[test]
@@ -564,6 +579,59 @@ mod tests {
         Err(
             DeserializationError(
                 "expected atom; got list",
+            ),
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_seq() {
+        assert_eq!(
+            vec![true, false],
+            from_tokens::<Vec<bool>>(vec![LP, a("true"), a("false"), RP]).unwrap()
+        );
+
+        assert_eq!(
+            vec![1u8, 2u8],
+            from_tokens::<Vec<u8>>(vec![LP, a("1"), a("2"), RP]).unwrap()
+        );
+
+        assert_eq!(
+            vec![(), (), ()],
+            from_tokens::<Vec<()>>(vec![LP, LP, RP, LP, RP, LP, RP, RP]).unwrap()
+        );
+    }
+
+    #[test]
+    fn test_tuple_and_tuple_struct() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct TupleStruct<'a>(i8, (bool, i8), Cow<'a, str>);
+
+        fn sexp() -> Vec<Token> {
+            vec![LP, a("1"), LP, a("true"), a("2"), RP, a("abc"), RP]
+        }
+
+        assert_eq!(
+            (1, (true, 2), Cow::Borrowed("abc")),
+            from_tokens::<(i8, (bool, i8), Cow<str>)>(sexp()).unwrap(),
+        );
+        assert_eq!(
+            TupleStruct(1, (true, 2), Cow::Borrowed("abc")),
+            from_tokens::<TupleStruct>(sexp()).unwrap(),
+        );
+
+        assert_debug_snapshot!(from_tokens::<(i8, bool, String)>(vec![LP, a("0"), a("false"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "invalid length 2, expected a tuple of size 3",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<TupleStruct>(vec![LP, a("0"), a("false"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "expected list",
             ),
         )
         "#);
