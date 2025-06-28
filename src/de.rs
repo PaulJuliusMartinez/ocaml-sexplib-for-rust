@@ -125,11 +125,16 @@ macro_rules! impl_deserialize_float {
 impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     type Error = Error;
 
-    fn deserialize_any<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        match self.peek()? {
+            None => error("reached end of input"),
+            Some(&Token::RightParen) => error("unexpected end of list"),
+            Some(&Token::LeftParen) => self.deserialize_seq(visitor),
+            Some(&Token::Atom(_)) => self.deserialize_str(visitor),
+        }
     }
 
     fn deserialize_bool<V>(self, visitor: V) -> Result<V::Value>
@@ -221,7 +226,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     {
         self.expect_start_of_list()?;
         match self.peek()? {
-            None => error(" reached end of input"),
+            None => error("reached end of input"),
             Some(&Token::RightParen) => {
                 self.advance();
                 visitor.visit_none()
@@ -296,23 +301,24 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         self.deserialize_tuple(len, visitor)
     }
 
-    fn deserialize_map<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_map<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.expect_start_of_list()?;
+        visitor.visit_map(self)
     }
 
     fn deserialize_struct<V>(
         self,
         _name: &'static str,
         _fields: &'static [&'static str],
-        _visitor: V,
+        visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.deserialize_map(visitor)
     }
 
     fn deserialize_enum<V>(
@@ -327,18 +333,18 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         unimplemented!();
     }
 
-    fn deserialize_identifier<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.deserialize_str(visitor)
     }
 
-    fn deserialize_ignored_any<V>(self, _visitor: V) -> Result<V::Value>
+    fn deserialize_ignored_any<V>(self, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        self.deserialize_any(visitor)
     }
 }
 
@@ -366,18 +372,34 @@ impl<'de> SeqAccess<'de> for Deserializer {
 impl<'de> MapAccess<'de> for Deserializer {
     type Error = Error;
 
-    fn next_key_seed<K>(&mut self, _seed: K) -> Result<Option<K::Value>>
+    fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
     where
         K: DeserializeSeed<'de>,
     {
-        unimplemented!();
+        match self.peek()? {
+            None => error("reached end of input"),
+            Some(&Token::Atom(_)) => error("expect key-value pair, but got atom"),
+            Some(&Token::RightParen) => {
+                self.advance();
+                Ok(None)
+            }
+            Some(&Token::LeftParen) => {
+                self.advance();
+                let value = seed.deserialize(&mut *self)?;
+                Ok(Some(value))
+            }
+        }
     }
 
-    fn next_value_seed<V>(&mut self, _seed: V) -> Result<V::Value>
+    fn next_value_seed<V>(&mut self, seed: V) -> Result<V::Value>
     where
         V: DeserializeSeed<'de>,
     {
-        unimplemented!();
+        let result = seed.deserialize(&mut *self);
+        if result.is_ok() {
+            self.expect_end_of_list()?;
+        }
+        result
     }
 }
 
@@ -635,5 +657,197 @@ mod tests {
             ),
         )
         "#);
+    }
+
+    #[test]
+    fn test_map() {
+        use std::collections::BTreeMap;
+
+        let test = vec![
+            LP,
+            LP,
+            LP,
+            a("1"),
+            a("foo"),
+            RP,
+            LP,
+            a("2"),
+            a("two"),
+            RP,
+            RP,
+            a("true"),
+            RP,
+        ];
+
+        assert_debug_snapshot!(from_tokens::<(BTreeMap<i32, String>, bool)>(test).unwrap(), @r#"
+        (
+            {
+                1: "foo",
+                2: "two",
+            },
+            true,
+        )
+        "#);
+
+        fn f(tokens: Vec<Token>) -> Result<BTreeMap<i32, i32>> {
+            from_tokens::<BTreeMap<i32, i32>>(tokens)
+        }
+
+        assert_debug_snapshot!(f(vec![LP, RP]).unwrap(), @r#"{}"#);
+
+        let atom_kvp = vec![LP, a("1"), RP];
+        assert_debug_snapshot!(f(atom_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "expect key-value pair, but got atom",
+        )
+        "#);
+
+        let unit_kvp = vec![LP, LP, RP, RP];
+        assert_debug_snapshot!(f(unit_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "expected atom; got end of list",
+        )
+        "#);
+
+        let one_element_kvp = vec![LP, LP, a("1"), RP, RP];
+        assert_debug_snapshot!(f(one_element_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "expected atom; got end of list",
+        )
+        "#);
+
+        let three_element_kvp = vec![LP, LP, a("1"), a("2"), a("3"), RP, RP];
+        assert_debug_snapshot!(f(three_element_kvp).unwrap_err(), @r#"
+        DeserializationError(
+            "expected end of list",
+        )
+        "#);
+    }
+
+    #[test]
+    fn test_struct() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        struct Struct {
+            x: i32,
+            y: bool,
+        }
+
+        let tokens = vec![
+            LP,
+            a("start"),
+            LP,
+            LP,
+            a("x"),
+            a("1"),
+            RP,
+            LP,
+            a("y"),
+            a("true"),
+            RP,
+            RP,
+            a("end"),
+            RP,
+        ];
+
+        assert_eq!(
+            (
+                "start".to_owned(),
+                Struct { x: 1, y: true },
+                "end".to_owned()
+            ),
+            from_tokens::<(String, Struct, String)>(tokens).unwrap(),
+        );
+
+        let atom_kvp = vec![LP, a("key: value"), RP];
+        let unit_kvp = vec![LP, LP, RP, RP];
+        let one_element_kvp = vec![LP, LP, a("x"), RP, RP];
+        let unknown_one_element_kvp = vec![LP, LP, a("z"), RP, RP];
+        let three_element_kvp = vec![LP, LP, a("x"), a("1"), a("true"), RP, RP];
+
+        assert_debug_snapshot!(from_tokens::<Struct>(atom_kvp), @r#"
+        Err(
+            DeserializationError(
+                "expect key-value pair, but got atom",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Struct>(unit_kvp), @r#"
+        Err(
+            DeserializationError(
+                "expected atom; got end of list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Struct>(one_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "expected atom; got end of list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Struct>(unknown_one_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "unexpected end of list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Struct>(three_element_kvp), @r#"
+        Err(
+            DeserializationError(
+                "expected end of list",
+            ),
+        )
+        "#);
+
+        // Mostly testing serde's internals here.
+
+        // Missing keys
+        assert_debug_snapshot!(from_tokens::<Struct>(vec![LP, RP]), @r#"
+        Err(
+            DeserializationError(
+                "missing field `x`",
+            ),
+        )
+        "#);
+
+        // Duplicate key
+        assert_debug_snapshot!(from_tokens::<Struct>(vec![LP, LP, a("x"), a("1"), RP, LP, a("x"), a("2"), RP, RP]), @r#"
+        Err(
+            DeserializationError(
+                "duplicate field `x`",
+            ),
+        )
+        "#);
+
+        // Extra_key is ignored
+        let tokens = vec![
+            LP,
+            LP,
+            a("x"),
+            a("1"),
+            RP,
+            LP,
+            a("y"),
+            a("true"),
+            RP,
+            LP,
+            a("z"),
+            a("0"),
+            RP,
+            RP,
+        ];
+        assert_debug_snapshot!(from_tokens::<Struct>(tokens), @r"
+        Ok(
+            Struct {
+                x: 1,
+                y: true,
+            },
+        )
+        ");
     }
 }
