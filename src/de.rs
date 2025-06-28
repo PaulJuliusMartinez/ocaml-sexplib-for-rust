@@ -131,9 +131,9 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     {
         match self.peek()? {
             None => error("reached end of input"),
-            Some(&Token::RightParen) => error("unexpected end of list"),
-            Some(&Token::LeftParen) => self.deserialize_seq(visitor),
-            Some(&Token::Atom(_)) => self.deserialize_str(visitor),
+            Some(Token::RightParen) => error("unexpected end of list"),
+            Some(Token::LeftParen) => self.deserialize_seq(visitor),
+            Some(Token::Atom(_)) => self.deserialize_str(visitor),
         }
     }
 
@@ -227,11 +227,11 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         self.expect_start_of_list()?;
         match self.peek()? {
             None => error("reached end of input"),
-            Some(&Token::RightParen) => {
+            Some(Token::RightParen) => {
                 self.advance();
                 visitor.visit_none()
             }
-            Some(&Token::LeftParen | &Token::Atom(_)) => {
+            Some(Token::LeftParen | Token::Atom(_)) => {
                 let value = visitor.visit_some(&mut *self)?;
                 self.expect_end_of_list()?;
                 Ok(value)
@@ -306,7 +306,11 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         V: Visitor<'de>,
     {
         self.expect_start_of_list()?;
-        visitor.visit_map(self)
+        let result = visitor.visit_map(&mut *self);
+        if result.is_ok() {
+            self.expect_end_of_list()?
+        }
+        result
     }
 
     fn deserialize_struct<V>(
@@ -325,12 +329,37 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         self,
         _name: &'static str,
         _variants: &'static [&'static str],
-        _visitor: V,
+        visitor: V,
     ) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        match self.peek()? {
+            None => error("reached end of input"),
+            Some(Token::RightParen) => error("expected variant; got end of list"),
+            Some(Token::Atom(atom)) => {
+                match std::str::from_utf8(atom.as_slice()) {
+                    Ok(s) => {
+                        // `IntoDeserializer` is implemented for `&str` and returns a
+                        // `StrDeserializer`, which implements a special `EnumAccess`
+                        // that only knows how to handle unit variants.
+                        let sref: &str = s;
+                        let result = visitor.visit_enum(sref.into_deserializer());
+                        self.advance();
+                        result
+                    }
+                    Err(_) => error("atom was not valid UTF-8"),
+                }
+            }
+            Some(Token::LeftParen) => {
+                self.advance();
+                let result = visitor.visit_enum(&mut *self);
+                if result.is_ok() {
+                    self.expect_end_of_list()?;
+                }
+                result
+            }
+        }
     }
 
     fn deserialize_identifier<V>(self, visitor: V) -> Result<V::Value>
@@ -357,11 +386,11 @@ impl<'de> SeqAccess<'de> for Deserializer {
     {
         match self.peek()? {
             None => error("reached end of input"),
-            Some(&Token::RightParen) => {
+            Some(Token::RightParen) => {
                 self.advance();
                 Ok(None)
             }
-            Some(&Token::LeftParen | &Token::Atom(_)) => {
+            Some(Token::LeftParen | Token::Atom(_)) => {
                 let value = seed.deserialize(&mut *self)?;
                 Ok(Some(value))
             }
@@ -378,12 +407,9 @@ impl<'de> MapAccess<'de> for Deserializer {
     {
         match self.peek()? {
             None => error("reached end of input"),
-            Some(&Token::Atom(_)) => error("expect key-value pair, but got atom"),
-            Some(&Token::RightParen) => {
-                self.advance();
-                Ok(None)
-            }
-            Some(&Token::LeftParen) => {
+            Some(Token::Atom(_)) => error("expect key-value pair, but got atom"),
+            Some(Token::RightParen) => Ok(None),
+            Some(Token::LeftParen) => {
                 self.advance();
                 let value = seed.deserialize(&mut *self)?;
                 Ok(Some(value))
@@ -403,44 +429,45 @@ impl<'de> MapAccess<'de> for Deserializer {
     }
 }
 
-impl<'de> EnumAccess<'de> for Deserializer {
+impl<'de: 'b, 'b> EnumAccess<'de> for &'b mut Deserializer {
     type Error = Error;
     type Variant = Self;
 
-    fn variant_seed<V>(self, _seed: V) -> Result<(V::Value, Self::Variant)>
+    fn variant_seed<V>(self, seed: V) -> Result<(V::Value, Self::Variant)>
     where
         V: DeserializeSeed<'de>,
     {
-        unimplemented!();
+        let val = seed.deserialize(&mut *self)?;
+        Ok((val, self))
     }
 }
 
-impl<'de> VariantAccess<'de> for Deserializer {
+impl<'de: 'b, 'b> VariantAccess<'de> for &'b mut Deserializer {
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
-        unimplemented!();
+        error("`Deserializer::unit_variant` should not be called")
     }
 
-    fn newtype_variant_seed<T>(self, _seed: T) -> Result<T::Value>
+    fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
     where
         T: DeserializeSeed<'de>,
     {
-        unimplemented!();
+        seed.deserialize(self)
     }
 
-    fn tuple_variant<V>(self, _len: usize, _visitor: V) -> Result<V::Value>
+    fn tuple_variant<V>(self, _len: usize, visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        visitor.visit_seq(self)
     }
 
-    fn struct_variant<V>(self, _fields: &'static [&'static str], _visitor: V) -> Result<V::Value>
+    fn struct_variant<V>(self, _fields: &'static [&'static str], visitor: V) -> Result<V::Value>
     where
         V: Visitor<'de>,
     {
-        unimplemented!();
+        visitor.visit_map(self)
     }
 }
 
@@ -849,5 +876,126 @@ mod tests {
             },
         )
         ");
+    }
+
+    #[test]
+    fn test_variant() {
+        #[derive(Debug, Deserialize, PartialEq, Eq)]
+        enum Variant {
+            Unit,
+            Newtype(i32),
+            Tuple(i32, i32),
+            Struct { x: i32 },
+        }
+
+        // Check Unit
+
+        let unit_sexp = vec![LP, a("start"), a("Unit"), a("end"), RP];
+
+        assert_eq!(
+            ("start".to_owned(), Variant::Unit, "end".to_owned()),
+            from_tokens::<(String, Variant, String)>(unit_sexp).unwrap(),
+        );
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![a("Newtype")]), @r#"
+        Err(
+            DeserializationError(
+                "invalid type: unit variant, expected newtype variant",
+            ),
+        )
+        "#);
+
+        // Check Newtype
+
+        let newtype_sexp = vec![LP, a("start"), LP, a("Newtype"), a("1"), RP, a("end"), RP];
+
+        assert_eq!(
+            ("start".to_owned(), Variant::Newtype(1), "end".to_owned()),
+            from_tokens::<(String, Variant, String)>(newtype_sexp).unwrap(),
+        );
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Newtype"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "expected atom; got end of list",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Newtype"), a("1"), a("2"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "expected end of list",
+            ),
+        )
+        "#);
+
+        // Check Tuple
+
+        let tuple_tokens = vec![
+            LP,
+            a("start"),
+            LP,
+            a("Tuple"),
+            a("1"),
+            a("2"),
+            RP,
+            a("end"),
+            RP,
+        ];
+
+        assert_eq!(
+            ("start".to_owned(), Variant::Tuple(1, 2), "end".to_owned()),
+            from_tokens::<(String, Variant, String)>(tuple_tokens).unwrap(),
+        );
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Tuple"), a("1"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "invalid length 1, expected tuple variant Variant::Tuple with 2 elements",
+            ),
+        )
+        "#);
+
+        // Check Struct
+
+        let struct_sexp = vec![
+            LP,
+            a("start"),
+            LP,
+            a("Struct"),
+            LP,
+            a("x"),
+            a("1"),
+            RP,
+            RP,
+            a("end"),
+            RP,
+        ];
+
+        assert_eq!(
+            (
+                "start".to_owned(),
+                Variant::Struct { x: 1 },
+                "end".to_owned()
+            ),
+            from_tokens::<(String, Variant, String)>(struct_sexp).unwrap(),
+        );
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Struct"), a("1"), RP]), @r#"
+        Err(
+            DeserializationError(
+                "expect key-value pair, but got atom",
+            ),
+        )
+        "#);
+
+        assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Struct"), LP, a("x"), a("1"), a("bad"), RP, RP]), @r#"
+        Err(
+            DeserializationError(
+                "expected end of list",
+            ),
+        )
+        "#);
     }
 }

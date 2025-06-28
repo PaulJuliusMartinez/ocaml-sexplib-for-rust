@@ -505,7 +505,7 @@ impl<'a: 'de + 'b, 'de: 'b, 'b> VariantAccess<'de> for EnumDeserializer<'a, 'de,
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
-        error("`EnumDeserializer::unit_variant` not implemented yet")
+        error("`EnumDeserializer::unit_variant` should not be called")
     }
 
     fn newtype_variant_seed<T>(self, seed: T) -> Result<T::Value>
