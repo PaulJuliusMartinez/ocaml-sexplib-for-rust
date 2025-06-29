@@ -1,4 +1,3 @@
-use std::io;
 use std::num::{ParseFloatError, ParseIntError};
 
 use serde::de::{
@@ -8,11 +7,11 @@ use serde::de::{
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::tokenizer::Token;
+use crate::tokenizer::{Token, TokenIterator};
 
-pub struct Deserializer<'de> {
-    // Someday: This should be a peekable?
-    tokens: Vec<Token<'de>>,
+#[derive(Debug)]
+pub struct Deserializer<I> {
+    tokens: I,
 }
 
 fn error<V>(s: &str) -> Result<V> {
@@ -31,22 +30,24 @@ fn parse_float_error(err: ParseFloatError) -> Error {
     Error::DeserializationError(format!("unable to parse float: {:#?}", err))
 }
 
-impl<'de> Deserializer<'de> {
-    fn new(mut tokens: Vec<Token<'de>>) -> Deserializer<'de> {
-        tokens.reverse();
+impl<'de, I> Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
+    fn new(tokens: I) -> Deserializer<I> {
         Deserializer { tokens }
     }
 
     fn next(&mut self) -> Result<Option<Token<'de>>> {
-        Ok(self.tokens.pop())
+        Ok(self.tokens.next()?)
     }
 
     fn peek(&mut self) -> Result<Option<&Token<'de>>> {
-        Ok(self.tokens.last())
+        Ok(self.tokens.peek()?)
     }
 
     fn advance(&mut self) {
-        self.tokens.pop();
+        let _ = self.tokens.next();
     }
 
     fn expect_atom(&mut self) -> Result<&'de [u8]> {
@@ -76,8 +77,9 @@ impl<'de> Deserializer<'de> {
     }
 }
 
-fn from_tokens<'de, T>(tokens: Vec<Token<'de>>) -> Result<T>
+fn from_tokens<'de, I, T>(tokens: I) -> Result<T>
 where
+    I: TokenIterator<'de>,
     T: Deserialize<'de>,
 {
     let mut deserializer = Deserializer::new(tokens);
@@ -122,7 +124,10 @@ macro_rules! impl_deserialize_float {
     };
 }
 
-impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
+impl<'de: 'a, 'a, I> de::Deserializer<'de> for &'a mut Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
     type Error = Error;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -377,7 +382,10 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     }
 }
 
-impl<'de> SeqAccess<'de> for Deserializer<'de> {
+impl<'de, I> SeqAccess<'de> for Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
     type Error = Error;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
@@ -398,7 +406,10 @@ impl<'de> SeqAccess<'de> for Deserializer<'de> {
     }
 }
 
-impl<'de> MapAccess<'de> for Deserializer<'de> {
+impl<'de, I> MapAccess<'de> for Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
     type Error = Error;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
@@ -429,7 +440,10 @@ impl<'de> MapAccess<'de> for Deserializer<'de> {
     }
 }
 
-impl<'de: 'a, 'a> EnumAccess<'de> for &'a mut Deserializer<'de> {
+impl<'de: 'a, 'a, I> EnumAccess<'de> for &'a mut Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
     type Error = Error;
     type Variant = Self;
 
@@ -442,7 +456,10 @@ impl<'de: 'a, 'a> EnumAccess<'de> for &'a mut Deserializer<'de> {
     }
 }
 
-impl<'de: 'a, 'a> VariantAccess<'de> for &'a mut Deserializer<'de> {
+impl<'de: 'a, 'a, I> VariantAccess<'de> for &'a mut Deserializer<I>
+where
+    I: TokenIterator<'de>,
+{
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -476,8 +493,28 @@ mod tests {
     use super::*;
 
     use std::borrow::Cow;
+    use std::io;
 
     use insta::assert_debug_snapshot;
+
+    impl<'de> TokenIterator<'de> for Vec<Token<'de>> {
+        fn next(&mut self) -> io::Result<Option<Token<'de>>> {
+            Ok(self.pop())
+        }
+
+        fn peek(&mut self) -> io::Result<Option<&Token<'de>>> {
+            Ok(self.last())
+        }
+    }
+
+    fn from_tokens<'de, T>(mut tokens: Vec<Token<'de>>) -> Result<T>
+    where
+        T: Deserialize<'de>,
+    {
+        tokens.reverse();
+        let mut deserializer = Deserializer::new(tokens);
+        T::deserialize(&mut deserializer)
+    }
 
     fn a(s: &str) -> Token {
         Token::Atom(s.as_bytes())

@@ -1,5 +1,5 @@
-use std;
 use std::fmt::{self, Display};
+use std::io;
 
 use serde::{de, ser};
 
@@ -9,12 +9,18 @@ pub type Result<T> = std::result::Result<T, Error>;
 pub enum Error {
     SerializationError(String),
     DeserializationError(String),
-    Io(std::io::Error),
+    Io(io::Error),
 }
 
 impl Error {
-    pub fn io(io_err: std::io::Error) -> Error {
+    pub fn io(io_err: io::Error) -> Error {
         Error::Io(io_err)
+    }
+}
+
+impl From<io::Error> for Error {
+    fn from(err: io::Error) -> Error {
+        Error::Io(err)
     }
 }
 
