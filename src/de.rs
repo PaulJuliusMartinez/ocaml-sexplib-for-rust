@@ -10,9 +10,9 @@ use serde::Deserialize;
 use crate::error::{Error, Result};
 use crate::tokenizer::Token;
 
-pub struct Deserializer {
+pub struct Deserializer<'de> {
     // Someday: This should be a peekable?
-    tokens: Vec<Token>,
+    tokens: Vec<Token<'de>>,
 }
 
 fn error<V>(s: &str) -> Result<V> {
@@ -31,17 +31,17 @@ fn parse_float_error(err: ParseFloatError) -> Error {
     Error::DeserializationError(format!("unable to parse float: {:#?}", err))
 }
 
-impl Deserializer {
-    fn new(mut tokens: Vec<Token>) -> Deserializer {
+impl<'de> Deserializer<'de> {
+    fn new(mut tokens: Vec<Token<'de>>) -> Deserializer<'de> {
         tokens.reverse();
         Deserializer { tokens }
     }
 
-    fn next(&mut self) -> Result<Option<Token>> {
+    fn next(&mut self) -> Result<Option<Token<'de>>> {
         Ok(self.tokens.pop())
     }
 
-    fn peek(&mut self) -> Result<Option<&Token>> {
+    fn peek(&mut self) -> Result<Option<&Token<'de>>> {
         Ok(self.tokens.last())
     }
 
@@ -49,7 +49,7 @@ impl Deserializer {
         self.tokens.pop();
     }
 
-    fn expect_atom(&mut self) -> Result<Vec<u8>> {
+    fn expect_atom(&mut self) -> Result<&'de [u8]> {
         match self.next()? {
             None => error("expected atom; reached end of input"),
             Some(Token::LeftParen) => error("expected atom; got list"),
@@ -76,7 +76,7 @@ impl Deserializer {
     }
 }
 
-fn from_tokens<'de, T>(tokens: Vec<Token>) -> Result<T>
+fn from_tokens<'de, T>(tokens: Vec<Token<'de>>) -> Result<T>
 where
     T: Deserialize<'de>,
 {
@@ -93,7 +93,7 @@ macro_rules! impl_deserialize_int {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(atom.as_slice()) {
+            match std::str::from_utf8(atom) {
                 Err(_) => error("expected int literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$int_t>().map_err(parse_int_error)?;
@@ -111,7 +111,7 @@ macro_rules! impl_deserialize_float {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(atom.as_slice()) {
+            match std::str::from_utf8(atom) {
                 Err(_) => error("expected float literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$float_t>().map_err(parse_float_error)?;
@@ -122,7 +122,7 @@ macro_rules! impl_deserialize_float {
     };
 }
 
-impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
+impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer<'de> {
     type Error = Error;
 
     fn deserialize_any<V>(self, visitor: V) -> Result<V::Value>
@@ -141,7 +141,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     where
         V: Visitor<'de>,
     {
-        let b = match self.expect_atom()?.as_slice() {
+        let b = match self.expect_atom()? {
             b"true" => true,
             b"false" => false,
             _ => return error("expected `true` or `false`"),
@@ -169,7 +169,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        let mut chars = match std::str::from_utf8(atom.as_slice()) {
+        let mut chars = match std::str::from_utf8(atom) {
             Ok(s) => s.chars(),
             Err(_) => return error("expected valid UTF-8 for char value"),
         };
@@ -193,7 +193,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         // Someday: Make `Token` have a `Cow`, so this can pass a borrowed string
         // if possible.
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(atom.as_slice()) {
+        match std::str::from_utf8(atom) {
             Ok(s) => visitor.visit_string(s.to_owned()),
             Err(_) => error("atom was not valid UTF-8"),
         }
@@ -253,7 +253,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(atom.as_slice()) {
+        match std::str::from_utf8(atom) {
             Ok(s) => {
                 if s == name {
                     visitor.visit_unit()
@@ -338,7 +338,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
             None => error("reached end of input"),
             Some(Token::RightParen) => error("expected variant; got end of list"),
             Some(Token::Atom(atom)) => {
-                match std::str::from_utf8(atom.as_slice()) {
+                match std::str::from_utf8(atom) {
                     Ok(s) => {
                         // `IntoDeserializer` is implemented for `&str` and returns a
                         // `StrDeserializer`, which implements a special `EnumAccess`
@@ -377,7 +377,7 @@ impl<'de: 'a, 'a> de::Deserializer<'de> for &'a mut Deserializer {
     }
 }
 
-impl<'de> SeqAccess<'de> for Deserializer {
+impl<'de> SeqAccess<'de> for Deserializer<'de> {
     type Error = Error;
 
     fn next_element_seed<T>(&mut self, seed: T) -> Result<Option<T::Value>>
@@ -398,7 +398,7 @@ impl<'de> SeqAccess<'de> for Deserializer {
     }
 }
 
-impl<'de> MapAccess<'de> for Deserializer {
+impl<'de> MapAccess<'de> for Deserializer<'de> {
     type Error = Error;
 
     fn next_key_seed<K>(&mut self, seed: K) -> Result<Option<K::Value>>
@@ -429,7 +429,7 @@ impl<'de> MapAccess<'de> for Deserializer {
     }
 }
 
-impl<'de: 'b, 'b> EnumAccess<'de> for &'b mut Deserializer {
+impl<'de: 'a, 'a> EnumAccess<'de> for &'a mut Deserializer<'de> {
     type Error = Error;
     type Variant = Self;
 
@@ -442,7 +442,7 @@ impl<'de: 'b, 'b> EnumAccess<'de> for &'b mut Deserializer {
     }
 }
 
-impl<'de: 'b, 'b> VariantAccess<'de> for &'b mut Deserializer {
+impl<'de: 'a, 'a> VariantAccess<'de> for &'a mut Deserializer<'de> {
     type Error = Error;
 
     fn unit_variant(self) -> Result<()> {
@@ -480,7 +480,7 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     fn a(s: &str) -> Token {
-        Token::Atom(s.as_bytes().to_vec())
+        Token::Atom(s.as_bytes())
     }
 
     const LP: Token = Token::LeftParen;
@@ -656,7 +656,7 @@ mod tests {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         struct TupleStruct<'a>(i8, (bool, i8), Cow<'a, str>);
 
-        fn sexp() -> Vec<Token> {
+        fn sexp() -> Vec<Token<'static>> {
             vec![LP, a("1"), LP, a("true"), a("2"), RP, a("abc"), RP]
         }
 

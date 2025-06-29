@@ -1,5 +1,5 @@
-pub enum Token {
+pub enum Token<'de> {
     LeftParen,
-    Atom(Vec<u8>),
+    Atom(&'de [u8]),
     RightParen,
 }
