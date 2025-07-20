@@ -1,6 +1,8 @@
 use std::borrow::Cow;
 use std::io;
 
+// Someday: This should maybe be called `DataToken` (as opposed to `DocToken`, which
+// would include comments?
 #[derive(Debug)]
 pub enum Token<'de> {
     LeftParen,
@@ -12,6 +14,25 @@ pub trait TokenIterator<'de> {
     fn next(&mut self) -> io::Result<Option<Token<'de>>>;
 
     fn peek(&mut self) -> io::Result<Option<&Token<'de>>>;
+}
+
+pub enum RawToken<'de> {
+    LeftParen,
+    RightParen,
+    Atom(Cow<'de, [u8]>),
+    LineComment(Cow<'de, [u8]>),
+    BlockComment(Cow<'de, [u8]>),
+    SexpComment,
+}
+
+impl<'de> RawToken<'de> {
+    fn from_data_and_kind(data: Cow<'de, [u8]>, kind: VariableLengthTokenKind) -> RawToken<'de> {
+        match kind {
+            VariableLengthTokenKind::Atom => RawToken::Atom(data),
+            VariableLengthTokenKind::LineComment => RawToken::LineComment(data),
+            VariableLengthTokenKind::BlockComment => RawToken::BlockComment(data),
+        }
+    }
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -113,6 +134,10 @@ pub enum Error {
     UnexpectedEndOfBlockComment,
     UnexpectedEofWhileInInQuotedAtom,
     UnexpectedEofWhileInBlockComment,
+    // Returned by `StreamingTokenizer`
+    UnexpectedTokenContinuation,
+    UnexpectedTokenStartStillProcessingPreviousToken,
+    UnexpectedEofWhileConstructingTokenFragments,
 }
 
 macro_rules! whitespace {
@@ -465,6 +490,106 @@ impl StreamingFragmentTokenizer {
     }
 }
 
+pub struct StreamingTokenizer {
+    fragment_tokenizer: StreamingFragmentTokenizer,
+    current_reconstructed_token: Option<(Vec<u8>, VariableLengthTokenKind)>,
+}
+
+impl StreamingTokenizer {
+    pub fn new() -> StreamingTokenizer {
+        StreamingTokenizer {
+            fragment_tokenizer: StreamingFragmentTokenizer::new(),
+            current_reconstructed_token: None,
+        }
+    }
+
+    pub fn iter_raw_tokens<'st, 'de>(
+        &'st mut self,
+        buffer: &'de [u8],
+    ) -> impl Iterator<Item = Result<RawToken<'de>, Error>> {
+        let mut tokens = vec![];
+
+        for raw_token_fragment in self.fragment_tokenizer.iter_raw_token_fragments(buffer) {
+            match raw_token_fragment {
+                Err(error) => tokens.push(Err(error)),
+                Ok(RawTokenFragment::LeftParen) => tokens.push(Ok(RawToken::LeftParen)),
+                Ok(RawTokenFragment::RightParen) => tokens.push(Ok(RawToken::RightParen)),
+                Ok(RawTokenFragment::SexpComment) => tokens.push(Ok(RawToken::SexpComment)),
+                Ok(RawTokenFragment::Atom(atom)) => {
+                    tokens.push(Ok(RawToken::Atom(Cow::Borrowed(atom))))
+                }
+                Ok(RawTokenFragment::LineComment(line_comment)) => {
+                    tokens.push(Ok(RawToken::LineComment(Cow::Borrowed(line_comment))))
+                }
+                Ok(RawTokenFragment::BlockComment(block_comment)) => {
+                    tokens.push(Ok(RawToken::BlockComment(Cow::Borrowed(block_comment))))
+                }
+                Ok(RawTokenFragment::StartOfToken(fragment, kind)) => {
+                    if self.current_reconstructed_token.is_some() {
+                        tokens.push(Err(Error::UnexpectedTokenStartStillProcessingPreviousToken));
+                        return tokens.into_iter();
+                    }
+                    self.current_reconstructed_token = Some((fragment.to_vec(), kind));
+                }
+                Ok(RawTokenFragment::MiddleOfToken(fragment)) => {
+                    let Some((token_data, _)) = &mut self.current_reconstructed_token else {
+                        tokens.push(Err(Error::UnexpectedTokenContinuation));
+                        return tokens.into_iter();
+                    };
+
+                    token_data.extend_from_slice(fragment);
+                }
+                Ok(RawTokenFragment::EndOfToken(fragment)) => {
+                    let Some((mut token_data, kind)) = self.current_reconstructed_token.take()
+                    else {
+                        tokens.push(Err(Error::UnexpectedTokenContinuation));
+                        return tokens.into_iter();
+                    };
+
+                    token_data.extend_from_slice(fragment);
+                    tokens.push(Ok(RawToken::from_data_and_kind(
+                        Cow::Owned(token_data),
+                        kind,
+                    )));
+                }
+            }
+        }
+
+        tokens.into_iter()
+    }
+
+    pub fn eof(self) -> Result<Option<RawToken<'static>>, Error> {
+        match self.fragment_tokenizer.eof() {
+            Err(error) => Err(error),
+            Ok(None) => Ok(None),
+            Ok(Some(raw_token_fragment)) => match raw_token_fragment {
+                RawTokenFragment::LeftParen => Ok(Some(RawToken::LeftParen)),
+                RawTokenFragment::RightParen => Ok(Some(RawToken::RightParen)),
+                RawTokenFragment::SexpComment => Ok(Some(RawToken::SexpComment)),
+                RawTokenFragment::Atom(atom) => Ok(Some(RawToken::Atom(Cow::Borrowed(atom)))),
+                RawTokenFragment::LineComment(_)
+                | RawTokenFragment::BlockComment(_)
+                | RawTokenFragment::StartOfToken(_, _)
+                | RawTokenFragment::MiddleOfToken(_) => {
+                    Err(Error::UnexpectedEofWhileConstructingTokenFragments)
+                }
+                RawTokenFragment::EndOfToken(fragment) => {
+                    let Some((mut token_data, kind)) = self.current_reconstructed_token else {
+                        return Err(Error::UnexpectedTokenContinuation);
+                    };
+
+                    token_data.extend_from_slice(fragment);
+
+                    Ok(Some(RawToken::from_data_and_kind(
+                        Cow::Owned(token_data),
+                        kind,
+                    )))
+                }
+            },
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -473,6 +598,10 @@ mod tests {
 
     use bstr::ByteSlice;
     use insta::assert_snapshot;
+
+    fn format_error(err: Error) -> String {
+        format!("ERROR: {:?}", err)
+    }
 
     fn format_raw_token_fragment(token: RawTokenFragment<'_>) -> String {
         match token {
@@ -499,7 +628,7 @@ mod tests {
 
         for token in tokenizer.iter_raw_token_fragments(buffer) {
             let _ = match token {
-                Err(err) => writeln!(o, "ERROR: {:?}", err),
+                Err(err) => writeln!(o, "{}", format_error(err)),
                 Ok(token) => writeln!(o, "{}", format_raw_token_fragment(token)),
             };
         }
@@ -526,6 +655,64 @@ mod tests {
         }
 
         fragments.join("---\n")
+    }
+
+    fn format_raw_token(token: Result<RawToken<'_>, Error>) -> String {
+        fn borrowed_or_owned(cow: &Cow<'_, [u8]>) -> &'static str {
+            match cow {
+                Cow::Borrowed(_) => "borrowed",
+                Cow::Owned(_) => "owned",
+            }
+        }
+
+        let token = match token {
+            Err(err) => return format_error(err),
+            Ok(token) => token,
+        };
+
+        match token {
+            RawToken::LeftParen => "LeftParen: (".to_owned(),
+            RawToken::RightParen => "RightParen: )".to_owned(),
+            RawToken::SexpComment => "SexpComment: #;".to_owned(),
+            RawToken::Atom(atom) => {
+                format!("Atom: {:?} ({})", atom.as_bstr(), borrowed_or_owned(&atom))
+            }
+            RawToken::LineComment(line_comment) => {
+                format!(
+                    "LineComment: {:?} ({})",
+                    line_comment.as_bstr(),
+                    borrowed_or_owned(&line_comment)
+                )
+            }
+            RawToken::BlockComment(block_comment) => {
+                format!(
+                    "BlockComment: {:?} ({})",
+                    block_comment.as_bstr(),
+                    borrowed_or_owned(&block_comment)
+                )
+            }
+        }
+    }
+
+    fn streamed_tokens(buffers: &[&[u8]]) -> String {
+        let mut tokenizer = StreamingTokenizer::new();
+        let mut tokens = vec![];
+
+        for buffer in buffers {
+            tokens.extend(tokenizer.iter_raw_tokens(buffer));
+        }
+
+        match tokenizer.eof() {
+            Ok(None) => (),
+            Ok(Some(token)) => tokens.push(Ok(token)),
+            Err(err) => tokens.push(Err(err)),
+        }
+
+        tokens
+            .into_iter()
+            .map(format_raw_token)
+            .collect::<Vec<_>>()
+            .join("\n---\n")
     }
 
     #[test]
@@ -771,30 +958,79 @@ mod tests {
 
     #[test]
     fn test_eof_errors() {
-        insta::assert_snapshot!(streamed_fragments(&[b"#|"]), @r##"
+        assert_snapshot!(streamed_fragments(&[b"#|"]), @r##"
         Start of BlockComment: "#|"
         ---
         ERROR: UnexpectedEofWhileInBlockComment
         "##);
-        insta::assert_snapshot!(streamed_fragments(&[b"#| #"]), @r##"
+        assert_snapshot!(streamed_fragments(&[b"#| #"]), @r##"
         Start of BlockComment: "#| #"
         ---
         ERROR: UnexpectedEofWhileInBlockComment
         "##);
-        insta::assert_snapshot!(streamed_fragments(&[b"#| |"]), @r##"
+        assert_snapshot!(streamed_fragments(&[b"#| |"]), @r##"
         Start of BlockComment: "#| |"
         ---
         ERROR: UnexpectedEofWhileInBlockComment
         "##);
-        insta::assert_snapshot!(streamed_fragments(&[b"#| \""]), @r##"
+        assert_snapshot!(streamed_fragments(&[b"#| \""]), @r##"
         Start of BlockComment: "#| \""
         ---
         ERROR: UnexpectedEofWhileInBlockComment
         "##);
-        insta::assert_snapshot!(streamed_fragments(&[b"#| \"\\"]), @r##"
+        assert_snapshot!(streamed_fragments(&[b"#| \"\\"]), @r##"
         Start of BlockComment: "#| \"\\"
         ---
         ERROR: UnexpectedEofWhileInBlockComment
         "##);
+    }
+
+    #[test]
+    fn test_tokenizer() {
+        assert_snapshot!(
+            streamed_tokens(&[b"a1 a2", b" a3"]),
+            @r#"
+        Atom: "a1" (borrowed)
+        ---
+        Atom: "a2" (owned)
+        ---
+        Atom: "a3" (owned)
+        "#,
+        );
+
+        assert_snapshot!(
+            streamed_tokens(&[b"abc", b"def", b"ghi"]),
+            @r#"Atom: "abcdefghi" (owned)"#,
+        );
+
+        assert_snapshot!(
+            streamed_tokens(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
+            @r#"
+        LineComment: "; lc1" (borrowed)
+        ---
+        LineComment: "; lc2" (owned)
+        ---
+        LineComment: "; lc3" (owned)
+        "#,
+        );
+
+        assert_snapshot!(
+            streamed_tokens(&[b"; abc", b"def", b"ghi"]),
+            @r#"LineComment: "; abcdefghi" (owned)"#,
+        );
+
+        assert_snapshot!(
+            streamed_tokens(&[b"#| bc1 |# #| bc2 ", b"|#"]),
+            @r##"
+        BlockComment: "#| bc1 |#" (borrowed)
+        ---
+        BlockComment: "#| bc2 |#" (owned)
+        "##,
+        );
+
+        assert_snapshot!(
+            streamed_tokens(&[b"#| abc", b"def", b"ghi |#"]),
+            @r##"BlockComment: "#| abcdefghi |#" (owned)"##,
+        );
     }
 }
