@@ -6,7 +6,7 @@ use std::io;
 #[derive(Debug)]
 pub enum Token<'de> {
     LeftParen,
-    Atom(&'de [u8]),
+    Atom(Cow<'de, [u8]>),
     RightParen,
 }
 

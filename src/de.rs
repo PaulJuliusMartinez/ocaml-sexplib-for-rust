@@ -1,3 +1,4 @@
+use std::borrow::Cow;
 use std::num::{ParseFloatError, ParseIntError};
 
 use serde::de::{
@@ -50,7 +51,7 @@ where
         let _ = self.tokens.next();
     }
 
-    fn expect_atom(&mut self) -> Result<&'de [u8]> {
+    fn expect_atom(&mut self) -> Result<Cow<'de, [u8]>> {
         match self.next()? {
             None => error("expected atom; reached end of input"),
             Some(Token::LeftParen) => error("expected atom; got list"),
@@ -95,7 +96,7 @@ macro_rules! impl_deserialize_int {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(atom) {
+            match std::str::from_utf8(&atom) {
                 Err(_) => error("expected int literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$int_t>().map_err(parse_int_error)?;
@@ -113,7 +114,7 @@ macro_rules! impl_deserialize_float {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(atom) {
+            match std::str::from_utf8(&atom) {
                 Err(_) => error("expected float literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$float_t>().map_err(parse_float_error)?;
@@ -146,7 +147,7 @@ where
     where
         V: Visitor<'de>,
     {
-        let b = match self.expect_atom()? {
+        let b = match self.expect_atom()?.as_ref() {
             b"true" => true,
             b"false" => false,
             _ => return error("expected `true` or `false`"),
@@ -174,7 +175,7 @@ where
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        let mut chars = match std::str::from_utf8(atom) {
+        let mut chars = match std::str::from_utf8(&atom) {
             Ok(s) => s.chars(),
             Err(_) => return error("expected valid UTF-8 for char value"),
         };
@@ -198,7 +199,7 @@ where
         // Someday: Make `Token` have a `Cow`, so this can pass a borrowed string
         // if possible.
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(atom) {
+        match std::str::from_utf8(&atom) {
             Ok(s) => visitor.visit_string(s.to_owned()),
             Err(_) => error("atom was not valid UTF-8"),
         }
@@ -258,7 +259,7 @@ where
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(atom) {
+        match std::str::from_utf8(&atom) {
             Ok(s) => {
                 if s == name {
                     visitor.visit_unit()
@@ -516,8 +517,8 @@ mod tests {
         T::deserialize(&mut deserializer)
     }
 
-    fn a(s: &str) -> Token {
-        Token::Atom(s.as_bytes())
+    fn a(s: &str) -> Token<'_> {
+        Token::Atom(Cow::Borrowed(s.as_bytes()))
     }
 
     const LP: Token = Token::LeftParen;
