@@ -7,5 +7,6 @@ edition = "2021"
 serde = { version = "1.0", features = ["derive"] }
 
 [dev-dependencies]
+bstr = "1"
 insta = "1.43"
 serde_bytes = "0.11"
