@@ -1,5 +1,6 @@
 use std::borrow::Cow;
 use std::io;
+use std::ops::Range;
 
 // Someday: This should maybe be called `DataToken` (as opposed to `DocToken`, which
 // would include comments?
@@ -26,32 +27,44 @@ pub enum RawToken<'de> {
 }
 
 impl<'de> RawToken<'de> {
-    fn from_data_and_kind(data: Cow<'de, [u8]>, kind: VariableLengthTokenKind) -> RawToken<'de> {
+    fn from_data_and_kind(data: Cow<'de, [u8]>, kind: VarTokenKind) -> RawToken<'de> {
         match kind {
-            VariableLengthTokenKind::Atom => RawToken::Atom(data),
-            VariableLengthTokenKind::LineComment => RawToken::LineComment(data),
-            VariableLengthTokenKind::BlockComment => RawToken::BlockComment(data),
+            VarTokenKind::Atom => RawToken::Atom(data),
+            VarTokenKind::LineComment => RawToken::LineComment(data),
+            VarTokenKind::BlockComment => RawToken::BlockComment(data),
         }
     }
 }
 
 #[derive(Copy, Clone, Debug)]
-pub enum VariableLengthTokenKind {
+pub enum VarTokenKind {
     Atom,
     LineComment,
     BlockComment,
 }
 
-pub enum RawTokenFragment<'de> {
+// Someday: Make `Range<usize>` opaque, and force passing in a buffer to get bytes out.
+// ```
+// struct FragmentRef(Range<usize>);
+//
+// impl FragmentRef {
+//   fn bytes(self, buffer: &[u8]) -> &[u8]
+// }
+// ```
+//
+// Could we use a RefCell and push a ref at the end of this to make sure the buf
+// can't be modified until we're done processing all the tokens?
+pub enum RawTokenFragment {
     LeftParen,
     RightParen,
-    Atom(&'de [u8]),
-    LineComment(&'de [u8]),
-    BlockComment(&'de [u8]),
     SexpComment,
-    StartOfToken(&'de [u8], VariableLengthTokenKind),
-    MiddleOfToken(&'de [u8]),
-    EndOfToken(&'de [u8]),
+    FullToken(Range<usize>, VarTokenKind),
+    StartOfToken(Range<usize>, VarTokenKind),
+    MiddleOfToken(Range<usize>),
+    ByteOfToken(u8),
+    EndOfToken,
+    // Someday: Get rid of this gross hack.
+    SinglePoundSignAtom,
 }
 
 // Sexplib lexer: https://github.com/janestreet/sexplib/blob/master/src/lexer.mll
@@ -165,71 +178,40 @@ impl StreamingFragmentTokenizer {
         self.state = state;
     }
 
-    fn fragment<'st, 'de>(&'st self, buffer: &'de [u8], ends_before: usize) -> &'de [u8] {
-        &buffer[self.start_of_current_token..ends_before]
-    }
-
-    fn finish_atom<'st, 'de>(
-        &'st mut self,
-        buffer: &'de [u8],
-        ends_before: usize,
-        tokens: &mut Vec<Result<RawTokenFragment<'de>, Error>>,
-    ) {
-        let atom = self.fragment(buffer, ends_before);
-        if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::EndOfToken(atom)));
-        } else {
-            tokens.push(Ok(RawTokenFragment::Atom(atom)));
-        }
-    }
-
-    fn finish_line_comment<'st, 'de>(
-        &'st mut self,
-        buffer: &'de [u8],
-        ends_before: usize,
-        tokens: &mut Vec<Result<RawTokenFragment<'de>, Error>>,
-    ) {
-        let line_comment = self.fragment(buffer, ends_before);
-        if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::EndOfToken(line_comment)));
-        } else {
-            tokens.push(Ok(RawTokenFragment::LineComment(line_comment)));
-        }
-    }
-
-    fn finish_block_comment<'st, 'de>(
-        &'st mut self,
-        buffer: &'de [u8],
-        ends_before: usize,
-        tokens: &mut Vec<Result<RawTokenFragment<'de>, Error>>,
-    ) {
-        let block_comment = self.fragment(buffer, ends_before);
-        if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::EndOfToken(block_comment)));
-        } else {
-            tokens.push(Ok(RawTokenFragment::BlockComment(block_comment)));
-        }
-    }
-
     fn start_or_continue_token<'st, 'de>(
         &'st mut self,
-        kind: VariableLengthTokenKind,
+        kind: VarTokenKind,
         buffer: &'de [u8],
-        tokens: &mut Vec<Result<RawTokenFragment<'de>, Error>>,
+        tokens: &mut Vec<Result<RawTokenFragment, Error>>,
     ) {
-        let fragment = &buffer[self.start_of_current_token..];
+        let range = self.start_of_current_token..(buffer.len());
         if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::MiddleOfToken(fragment)));
+            tokens.push(Ok(RawTokenFragment::MiddleOfToken(range)));
         } else {
-            tokens.push(Ok(RawTokenFragment::StartOfToken(fragment, kind)));
+            tokens.push(Ok(RawTokenFragment::StartOfToken(range, kind)));
             self.already_emitted_start_of_current_token = true;
+        }
+    }
+
+    fn finish_token(
+        &mut self,
+        kind: VarTokenKind,
+        ends_before: usize,
+        tokens: &mut Vec<Result<RawTokenFragment, Error>>,
+    ) {
+        let range = self.start_of_current_token..ends_before;
+        if self.already_emitted_start_of_current_token {
+            tokens.push(Ok(RawTokenFragment::MiddleOfToken(range)));
+            tokens.push(Ok(RawTokenFragment::EndOfToken));
+        } else {
+            tokens.push(Ok(RawTokenFragment::FullToken(range, kind)));
         }
     }
 
     pub fn iter_raw_token_fragments<'st, 'de>(
         &'st mut self,
         mut buffer: &'de [u8],
-    ) -> impl Iterator<Item = Result<RawTokenFragment<'de>, Error>> {
+    ) -> impl Iterator<Item = Result<RawTokenFragment, Error>> {
         // Immediately return if no data to process
         if buffer.is_empty() {
             return vec![].into_iter();
@@ -249,18 +231,17 @@ impl StreamingFragmentTokenizer {
                 }
                 b'|' => {
                     tokens.push(Ok(RawTokenFragment::StartOfToken(
-                        b"#",
-                        VariableLengthTokenKind::BlockComment,
+                        0..0,
+                        VarTokenKind::BlockComment,
                     )));
+                    tokens.push(Ok(RawTokenFragment::ByteOfToken(b'#')));
                     self.state = TokenizationState::BlockComment;
                     self.block_comment_depth = 1;
                     self.already_emitted_start_of_current_token = true;
                 }
                 _ => {
-                    tokens.push(Ok(RawTokenFragment::StartOfToken(
-                        b"#",
-                        VariableLengthTokenKind::Atom,
-                    )));
+                    tokens.push(Ok(RawTokenFragment::StartOfToken(0..0, VarTokenKind::Atom)));
+                    tokens.push(Ok(RawTokenFragment::ByteOfToken(b'#')));
                     self.state = TokenizationState::InUnquotedAtomPoundSign;
                     self.already_emitted_start_of_current_token = true;
                 }
@@ -299,25 +280,25 @@ impl StreamingFragmentTokenizer {
                 | TokenizationState::PoundSign
                 | TokenizationState::Bar => match *ch {
                     whitespace!() => {
-                        self.finish_atom(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                         self.state = TokenizationState::Start;
                     }
                     b'(' => {
-                        self.finish_atom(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                         tokens.push(Ok(RawTokenFragment::LeftParen));
                         self.state = TokenizationState::Start;
                     }
                     b')' => {
-                        self.finish_atom(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                         tokens.push(Ok(RawTokenFragment::RightParen));
                         self.state = TokenizationState::Start;
                     }
                     b'\r' => {
-                        self.finish_atom(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                         self.state = TokenizationState::CarriageReturn;
                     }
                     b'"' => {
-                        self.finish_atom(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                         self.start_new_token(pos, TokenizationState::InQuotedAtom);
                     }
                     b';' => match self.state {
@@ -326,7 +307,7 @@ impl StreamingFragmentTokenizer {
                             self.state = TokenizationState::Start;
                         }
                         _ => {
-                            self.finish_atom(buffer, pos, &mut tokens);
+                            self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
                             self.start_new_token(pos, TokenizationState::LineComment);
                         }
                     },
@@ -360,7 +341,7 @@ impl StreamingFragmentTokenizer {
                     match *ch {
                         b'"' => {
                             if self.state == TokenizationState::InQuotedAtom {
-                                self.finish_atom(buffer, pos + 1, &mut tokens);
+                                self.finish_token(VarTokenKind::Atom, pos + 1, &mut tokens);
                                 self.state = TokenizationState::Start;
                             } else {
                                 self.state = TokenizationState::BlockComment;
@@ -384,11 +365,11 @@ impl StreamingFragmentTokenizer {
                 }
                 TokenizationState::LineComment => match *ch {
                     b'\n' => {
-                        self.finish_line_comment(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::LineComment, pos, &mut tokens);
                         self.state = TokenizationState::Start;
                     }
                     b'\r' => {
-                        self.finish_line_comment(buffer, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::LineComment, pos, &mut tokens);
                         self.state = TokenizationState::CarriageReturn;
                     }
                     _ => (),
@@ -414,7 +395,7 @@ impl StreamingFragmentTokenizer {
                     b'#' => {
                         self.block_comment_depth -= 1;
                         if self.block_comment_depth == 0 {
-                            self.finish_block_comment(buffer, pos + 1, &mut tokens);
+                            self.finish_token(VarTokenKind::BlockComment, pos + 1, &mut tokens);
                             self.state = TokenizationState::Start;
                         } else {
                             self.state = TokenizationState::BlockComment;
@@ -440,33 +421,25 @@ impl StreamingFragmentTokenizer {
             | TokenizationState::Bar
             | TokenizationState::InQuotedAtom
             | TokenizationState::InQuotedAtomEscape => {
-                self.start_or_continue_token(VariableLengthTokenKind::Atom, buffer, &mut tokens);
+                self.start_or_continue_token(VarTokenKind::Atom, buffer, &mut tokens);
             }
             // Started a line comment
             TokenizationState::LineComment => {
-                self.start_or_continue_token(
-                    VariableLengthTokenKind::LineComment,
-                    buffer,
-                    &mut tokens,
-                );
+                self.start_or_continue_token(VarTokenKind::LineComment, buffer, &mut tokens);
             }
             TokenizationState::BlockComment
             | TokenizationState::BlockCommentPoundSign
             | TokenizationState::BlockCommentBar
             | TokenizationState::BlockCommentInQuotedString
             | TokenizationState::BlockCommentInQuotedStringEscape => {
-                self.start_or_continue_token(
-                    VariableLengthTokenKind::BlockComment,
-                    buffer,
-                    &mut tokens,
-                );
+                self.start_or_continue_token(VarTokenKind::BlockComment, buffer, &mut tokens);
             }
         }
 
         tokens.into_iter()
     }
 
-    pub fn eof(self) -> Result<Option<RawTokenFragment<'static>>, Error> {
+    pub fn eof(self) -> Result<Option<RawTokenFragment>, Error> {
         match self.state {
             TokenizationState::Start => Ok(None),
             TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn),
@@ -474,8 +447,8 @@ impl StreamingFragmentTokenizer {
             | TokenizationState::InUnquotedAtomBar
             | TokenizationState::InUnquotedAtomPoundSign
             | TokenizationState::Bar
-            | TokenizationState::LineComment => Ok(Some(RawTokenFragment::EndOfToken(b""))),
-            TokenizationState::PoundSign => Ok(Some(RawTokenFragment::Atom(b"#"))),
+            | TokenizationState::LineComment => Ok(Some(RawTokenFragment::EndOfToken)),
+            TokenizationState::PoundSign => Ok(Some(RawTokenFragment::SinglePoundSignAtom)),
             TokenizationState::InQuotedAtom | TokenizationState::InQuotedAtomEscape => {
                 Err(Error::UnexpectedEofWhileInInQuotedAtom)
             }
@@ -492,7 +465,7 @@ impl StreamingFragmentTokenizer {
 
 pub struct StreamingTokenizer {
     fragment_tokenizer: StreamingFragmentTokenizer,
-    current_reconstructed_token: Option<(Vec<u8>, VariableLengthTokenKind)>,
+    current_reconstructed_token: Option<(Vec<u8>, VarTokenKind)>,
 }
 
 impl StreamingTokenizer {
@@ -515,42 +488,50 @@ impl StreamingTokenizer {
                 Ok(RawTokenFragment::LeftParen) => tokens.push(Ok(RawToken::LeftParen)),
                 Ok(RawTokenFragment::RightParen) => tokens.push(Ok(RawToken::RightParen)),
                 Ok(RawTokenFragment::SexpComment) => tokens.push(Ok(RawToken::SexpComment)),
-                Ok(RawTokenFragment::Atom(atom)) => {
-                    tokens.push(Ok(RawToken::Atom(Cow::Borrowed(atom))))
+                Ok(RawTokenFragment::FullToken(range, kind)) => {
+                    let data = Cow::Borrowed(&buffer[range]);
+                    let token = RawToken::from_data_and_kind(data, kind);
+                    tokens.push(Ok(token));
                 }
-                Ok(RawTokenFragment::LineComment(line_comment)) => {
-                    tokens.push(Ok(RawToken::LineComment(Cow::Borrowed(line_comment))))
-                }
-                Ok(RawTokenFragment::BlockComment(block_comment)) => {
-                    tokens.push(Ok(RawToken::BlockComment(Cow::Borrowed(block_comment))))
-                }
-                Ok(RawTokenFragment::StartOfToken(fragment, kind)) => {
+                Ok(RawTokenFragment::StartOfToken(range, kind)) => {
                     if self.current_reconstructed_token.is_some() {
                         tokens.push(Err(Error::UnexpectedTokenStartStillProcessingPreviousToken));
                         return tokens.into_iter();
                     }
+
+                    let fragment = &buffer[range];
                     self.current_reconstructed_token = Some((fragment.to_vec(), kind));
                 }
-                Ok(RawTokenFragment::MiddleOfToken(fragment)) => {
+                Ok(RawTokenFragment::MiddleOfToken(range)) => {
                     let Some((token_data, _)) = &mut self.current_reconstructed_token else {
                         tokens.push(Err(Error::UnexpectedTokenContinuation));
                         return tokens.into_iter();
                     };
 
+                    let fragment = &buffer[range];
                     token_data.extend_from_slice(fragment);
                 }
-                Ok(RawTokenFragment::EndOfToken(fragment)) => {
-                    let Some((mut token_data, kind)) = self.current_reconstructed_token.take()
-                    else {
+                Ok(RawTokenFragment::ByteOfToken(b)) => {
+                    let Some((token_data, _)) = &mut self.current_reconstructed_token else {
                         tokens.push(Err(Error::UnexpectedTokenContinuation));
                         return tokens.into_iter();
                     };
 
-                    token_data.extend_from_slice(fragment);
+                    token_data.push(b);
+                }
+                Ok(RawTokenFragment::EndOfToken) => {
+                    let Some((token_data, kind)) = self.current_reconstructed_token.take() else {
+                        tokens.push(Err(Error::UnexpectedTokenContinuation));
+                        return tokens.into_iter();
+                    };
+
                     tokens.push(Ok(RawToken::from_data_and_kind(
                         Cow::Owned(token_data),
                         kind,
                     )));
+                }
+                Ok(RawTokenFragment::SinglePoundSignAtom) => {
+                    tokens.push(Ok(RawToken::Atom(Cow::Borrowed(b"#"))))
                 }
             }
         }
@@ -566,24 +547,24 @@ impl StreamingTokenizer {
                 RawTokenFragment::LeftParen => Ok(Some(RawToken::LeftParen)),
                 RawTokenFragment::RightParen => Ok(Some(RawToken::RightParen)),
                 RawTokenFragment::SexpComment => Ok(Some(RawToken::SexpComment)),
-                RawTokenFragment::Atom(atom) => Ok(Some(RawToken::Atom(Cow::Borrowed(atom)))),
-                RawTokenFragment::LineComment(_)
-                | RawTokenFragment::BlockComment(_)
+                RawTokenFragment::FullToken(_, _)
                 | RawTokenFragment::StartOfToken(_, _)
-                | RawTokenFragment::MiddleOfToken(_) => {
+                | RawTokenFragment::MiddleOfToken(_)
+                | RawTokenFragment::ByteOfToken(_) => {
                     Err(Error::UnexpectedEofWhileConstructingTokenFragments)
                 }
-                RawTokenFragment::EndOfToken(fragment) => {
-                    let Some((mut token_data, kind)) = self.current_reconstructed_token else {
+                RawTokenFragment::EndOfToken => {
+                    let Some((token_data, kind)) = self.current_reconstructed_token else {
                         return Err(Error::UnexpectedTokenContinuation);
                     };
-
-                    token_data.extend_from_slice(fragment);
 
                     Ok(Some(RawToken::from_data_and_kind(
                         Cow::Owned(token_data),
                         kind,
                     )))
+                }
+                RawTokenFragment::SinglePoundSignAtom => {
+                    Ok(Some(RawToken::Atom(Cow::Borrowed(b"#"))))
                 }
             },
         }
@@ -603,19 +584,29 @@ mod tests {
         format!("ERROR: {:?}", err)
     }
 
-    fn format_raw_token_fragment(token: RawTokenFragment<'_>) -> String {
+    fn format_raw_token_fragment(token: RawTokenFragment, buffer: &[u8]) -> String {
         match token {
             RawTokenFragment::LeftParen => "LeftParen: (".to_owned(),
             RawTokenFragment::RightParen => "RightParen: )".to_owned(),
             RawTokenFragment::SexpComment => "SexpComment: #;".to_owned(),
-            RawTokenFragment::Atom(buf) => format!("Atom: {:?}", buf.as_bstr()),
-            RawTokenFragment::LineComment(buf) => format!("LineComment: {:?}", buf.as_bstr()),
-            RawTokenFragment::BlockComment(buf) => format!("BlockComment: {:?}", buf.as_bstr()),
-            RawTokenFragment::StartOfToken(buf, kind) => {
-                format!("Start of {:?}: {:?}", kind, buf.as_bstr())
+            RawTokenFragment::FullToken(range, kind) => {
+                let fragment = &buffer[range];
+                format!("{:?}: {:?}", kind, fragment.as_bstr())
             }
-            RawTokenFragment::MiddleOfToken(buf) => format!("Middle of token: {:?}", buf.as_bstr()),
-            RawTokenFragment::EndOfToken(buf) => format!("End of token: {:?}", buf.as_bstr()),
+            RawTokenFragment::StartOfToken(range, kind) => {
+                let fragment = &buffer[range];
+                format!("Start of {:?}: {:?}", kind, fragment.as_bstr())
+            }
+            RawTokenFragment::MiddleOfToken(range) => {
+                let fragment = &buffer[range];
+                format!("Middle of token: {:?}", fragment.as_bstr())
+            }
+            RawTokenFragment::ByteOfToken(b) => {
+                let buf = [b];
+                format!("Byte of token: {:?}", &buf.as_bstr())
+            }
+            RawTokenFragment::EndOfToken => "End of token".to_string(),
+            RawTokenFragment::SinglePoundSignAtom => "SinglePoundSignAtom: \"#\"".to_string(),
         }
     }
 
@@ -629,7 +620,7 @@ mod tests {
         for token in tokenizer.iter_raw_token_fragments(buffer) {
             let _ = match token {
                 Err(err) => writeln!(o, "{}", format_error(err)),
-                Ok(token) => writeln!(o, "{}", format_raw_token_fragment(token)),
+                Ok(token) => writeln!(o, "{}", format_raw_token_fragment(token, buffer)),
             };
         }
 
@@ -650,7 +641,11 @@ mod tests {
 
         match tokenizer.eof() {
             Ok(None) => (),
-            Ok(Some(token)) => fragments.push(format_raw_token_fragment(token)),
+            Ok(Some(token)) =>
+            // Token returned by `eof` should never reference the buffer, so this is fine.
+            {
+                fragments.push(format_raw_token_fragment(token, b""))
+            }
             Err(err) => fragments.push(format!("ERROR: {:?}", err)),
         }
 
@@ -859,7 +854,8 @@ mod tests {
         ---
         Middle of token: "def"
         ---
-        End of token: "ghi"
+        Middle of token: "ghi"
+        End of token
         "#,
         );
 
@@ -870,7 +866,8 @@ mod tests {
         ---
         Middle of token: "def"
         ---
-        End of token: "ghi"
+        Middle of token: "ghi"
+        End of token
         "#,
         );
 
@@ -881,7 +878,8 @@ mod tests {
         ---
         Middle of token: "def"
         ---
-        End of token: "ghi |#"
+        Middle of token: "ghi |#"
+        End of token
         "##,
         );
     }
@@ -894,14 +892,20 @@ mod tests {
         ---
         SexpComment: #;
         ---
-        Start of BlockComment: "#"
-        End of token: "| |#"
+        Start of BlockComment: ""
+        Byte of token: "#"
+        Middle of token: "| |#"
+        End of token
         ---
-        Start of Atom: "#"
-        End of token: "a"
+        Start of Atom: ""
+        Byte of token: "#"
+        Middle of token: "a"
+        End of token
         ---
-        Start of Atom: "#"
-        End of token: "#"
+        Start of Atom: ""
+        Byte of token: "#"
+        Middle of token: "#"
+        End of token
         "##,
         );
     }
@@ -917,42 +921,42 @@ mod tests {
         assert_snapshot!(streamed_fragments(&[b"a"]), @r#"
         Start of Atom: "a"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b"a|"]), @r#"
         Start of Atom: "a|"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b"a#"]), @r#"
         Start of Atom: "a#"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b"|"]), @r#"
         Start of Atom: "|"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b";"]), @r#"
         Start of LineComment: ";"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b";"]), @r#"
         Start of LineComment: ";"
         ---
-        End of token: ""
+        End of token
         "#);
 
         assert_snapshot!(streamed_fragments(&[b"#"]), @r##"
         ---
-        Atom: "#"
+        SinglePoundSignAtom: "#"
         "##);
     }
 
