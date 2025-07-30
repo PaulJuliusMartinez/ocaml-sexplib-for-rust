@@ -349,7 +349,7 @@ impl Tokenizer {
         }
     }
 
-    pub fn process_more_data(&mut self, mut buffer: &[u8]) {
+    pub fn process_more_data(&mut self, buffer: &[u8]) {
         // Immediately return if no data to process
         if buffer.is_empty() {
             return;
@@ -360,28 +360,6 @@ impl Tokenizer {
                 .push_back(Err(Error::TriedToProcessMoreDataAfterEof));
             return;
         };
-
-        // Handle leftover state and possibly emit a token for the last character
-        // we saw, based on peeking at the next char.
-        if previous_state == TokenizationState::PoundSign {
-            match buffer[0] {
-                b';' => {
-                    self.raw_token_refs.push_back(Ok(RawTokenRef::SexpComment));
-                    // Don't process ';' again
-                    buffer = &buffer[1..];
-                    self.state = Some(TokenizationState::Start);
-                }
-                b'|' => {
-                    self.state = Some(TokenizationState::BlockComment);
-                    self.block_comment_depth = 1;
-                }
-                _ => {
-                    // We already know that `buffer[0]` isn't a '|', so there's no chance of us
-                    // seeing one and returning a `BlockCommentStartTokenInUnquotedAtom` error.
-                    self.state = Some(TokenizationState::InUnquotedAtomPoundSign);
-                }
-            }
-        }
 
         self.start_of_current_token = 0;
 
