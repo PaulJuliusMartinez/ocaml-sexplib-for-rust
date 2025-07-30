@@ -1,4 +1,5 @@
 use std::borrow::Cow;
+use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 
@@ -17,21 +18,16 @@ pub trait TokenIterator<'de> {
     fn peek(&mut self) -> io::Result<Option<&Token<'de>>>;
 }
 
-pub enum RawToken<'de> {
-    LeftParen,
-    RightParen,
-    Atom(Cow<'de, [u8]>),
-    LineComment(Cow<'de, [u8]>),
-    BlockComment(Cow<'de, [u8]>),
-    SexpComment,
+enum TokenBytes<'de, 't> {
+    Borrowed(&'de [u8]),
+    Transient(&'t [u8]),
 }
 
-impl<'de> RawToken<'de> {
-    fn from_data_and_kind(data: Cow<'de, [u8]>, kind: VarTokenKind) -> RawToken<'de> {
-        match kind {
-            VarTokenKind::Atom => RawToken::Atom(data),
-            VarTokenKind::LineComment => RawToken::LineComment(data),
-            VarTokenKind::BlockComment => RawToken::BlockComment(data),
+impl<'de, 't> TokenBytes<'de, 't> {
+    fn bytes<'a>(&'a self) -> &'a [u8] {
+        match self {
+            TokenBytes::Borrowed(buf) => &*buf,
+            TokenBytes::Transient(buf) => &*buf,
         }
     }
 }
@@ -43,28 +39,52 @@ pub enum VarTokenKind {
     BlockComment,
 }
 
-// Someday: Make `Range<usize>` opaque, and force passing in a buffer to get bytes out.
-// ```
-// struct FragmentRef(Range<usize>);
-//
-// impl FragmentRef {
-//   fn bytes(self, buffer: &[u8]) -> &[u8]
-// }
-// ```
-//
-// Could we use a RefCell and push a ref at the end of this to make sure the buf
-// can't be modified until we're done processing all the tokens?
-pub enum RawTokenFragment {
+pub enum RawToken<'de, 't> {
+    LeftParen,
+    RightParen,
+    Atom(TokenBytes<'de, 't>),
+    LineComment(TokenBytes<'de, 't>),
+    BlockComment(TokenBytes<'de, 't>),
+    SexpComment,
+}
+
+impl<'de, 't> RawToken<'de, 't> {
+    fn from_token_bytes_and_kind(
+        token_bytes: TokenBytes<'de, 't>,
+        kind: VarTokenKind,
+    ) -> RawToken<'de, 't> {
+        match kind {
+            VarTokenKind::Atom => RawToken::Atom(token_bytes),
+            VarTokenKind::LineComment => RawToken::LineComment(token_bytes),
+            VarTokenKind::BlockComment => RawToken::BlockComment(token_bytes),
+        }
+    }
+}
+
+enum TokenizerData<'a> {
+    Data(&'a [u8]),
+    Eof,
+}
+
+trait DataSource<'de> {
+    // Someday: This needs to return `io::Result`.
+    fn get_more_data<'s>(&'s mut self) -> TokenizerData<'s>;
+    // Someday: Better word than "buffer"?
+    fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's>;
+}
+
+#[derive(Debug)]
+enum RawTokenRefData {
+    Range(Range<usize>),
+    Scratch,
+}
+
+#[derive(Debug)]
+enum RawTokenRef {
     LeftParen,
     RightParen,
     SexpComment,
-    FullToken(Range<usize>, VarTokenKind),
-    StartOfToken(Range<usize>, VarTokenKind),
-    MiddleOfToken(Range<usize>),
-    ByteOfToken(u8),
-    EndOfToken,
-    // Someday: Get rid of this gross hack.
-    SinglePoundSignAtom,
+    VarToken(RawTokenRefData, VarTokenKind),
 }
 
 // Sexplib lexer: https://github.com/janestreet/sexplib/blob/master/src/lexer.mll
@@ -128,13 +148,18 @@ enum TokenizationState {
     BlockCommentInQuotedStringEscape,
 }
 
-pub struct StreamingFragmentTokenizer {
-    state: TokenizationState,
-    byte_offset: u64,
-    line_num: u64,
-    col_num: u64,
+pub struct Tokenizer {
+    // None when done tokenizing.
+    // Someday: indicate EOF vs error states separately?
+    state: Option<TokenizationState>,
+    scratch_buffer_for_a_previous_token: Vec<u8>,
+    scratch_buffer_for_current_token: Vec<u8>,
+    using_scratch_buffer_for_current_token: bool,
+    raw_token_refs: VecDeque<Result<RawTokenRef, Error>>,
+    // byte_offset: u64,
+    // line_num: u64,
+    // col_num: u64,
     block_comment_depth: i64,
-    already_emitted_start_of_current_token: bool,
     // Only valid during one iteration
     start_of_current_token: usize,
 }
@@ -147,10 +172,8 @@ pub enum Error {
     UnexpectedEndOfBlockComment,
     UnexpectedEofWhileInInQuotedAtom,
     UnexpectedEofWhileInBlockComment,
-    // Returned by `StreamingTokenizer`
-    UnexpectedTokenContinuation,
-    UnexpectedTokenStartStillProcessingPreviousToken,
-    UnexpectedEofWhileConstructingTokenFragments,
+    TriedToProcessMoreDataAfterEof,
+    EofCalledMultipleTimes,
 }
 
 macro_rules! whitespace {
@@ -159,91 +182,140 @@ macro_rules! whitespace {
     };
 }
 
-impl StreamingFragmentTokenizer {
-    pub fn new() -> StreamingFragmentTokenizer {
-        StreamingFragmentTokenizer {
-            state: TokenizationState::Start,
-            byte_offset: 0,
-            line_num: 1,
-            col_num: 0,
+impl Tokenizer {
+    pub fn new() -> Tokenizer {
+        Tokenizer {
+            state: Some(TokenizationState::Start),
+            scratch_buffer_for_a_previous_token: vec![],
+            scratch_buffer_for_current_token: vec![],
+            using_scratch_buffer_for_current_token: false,
+            raw_token_refs: VecDeque::new(),
+            // byte_offset: 0,
+            // line_num: 1,
+            // col_num: 0,
             block_comment_depth: 0,
-            already_emitted_start_of_current_token: false,
             start_of_current_token: 0,
         }
     }
 
+    fn need_more_data_to_produce_tokens(&self) -> bool {
+        self.raw_token_refs.is_empty() && self.state.is_some()
+    }
+
     fn start_new_token(&mut self, pos: usize, state: TokenizationState) {
-        self.already_emitted_start_of_current_token = false;
+        self.using_scratch_buffer_for_current_token = false;
         self.start_of_current_token = pos;
-        self.state = state;
+        self.state = Some(state);
     }
 
-    fn start_or_continue_token<'st, 'de>(
-        &'st mut self,
-        kind: VarTokenKind,
-        buffer: &'de [u8],
-        tokens: &mut Vec<Result<RawTokenFragment, Error>>,
-    ) {
-        let range = self.start_of_current_token..(buffer.len());
-        if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::MiddleOfToken(range)));
-        } else {
-            tokens.push(Ok(RawTokenFragment::StartOfToken(range, kind)));
-            self.already_emitted_start_of_current_token = true;
+    fn copy_partial_token_to_scratch_buffer<'st, 'de>(&'st mut self, buffer: &'de [u8]) {
+        let partial_token = &buffer[self.start_of_current_token..];
+        if !self.using_scratch_buffer_for_current_token {
+            self.scratch_buffer_for_current_token.clear();
+            self.using_scratch_buffer_for_current_token = true;
         }
+        self.scratch_buffer_for_current_token
+            .extend_from_slice(partial_token);
     }
 
-    fn finish_token(
-        &mut self,
-        kind: VarTokenKind,
-        ends_before: usize,
-        tokens: &mut Vec<Result<RawTokenFragment, Error>>,
-    ) {
+    fn finish_token(&mut self, kind: VarTokenKind, ends_before: usize, buffer: &[u8]) {
         let range = self.start_of_current_token..ends_before;
-        if self.already_emitted_start_of_current_token {
-            tokens.push(Ok(RawTokenFragment::MiddleOfToken(range)));
-            tokens.push(Ok(RawTokenFragment::EndOfToken));
+        let raw_token_ref_data = if self.using_scratch_buffer_for_current_token {
+            let partial_token = &buffer[range];
+            self.scratch_buffer_for_current_token
+                .extend_from_slice(partial_token);
+            self.complete_token_in_scratch_buffer();
+            RawTokenRefData::Scratch
         } else {
-            tokens.push(Ok(RawTokenFragment::FullToken(range, kind)));
+            RawTokenRefData::Range(range)
+        };
+
+        self.raw_token_refs
+            .push_back(Ok(RawTokenRef::VarToken(raw_token_ref_data, kind)));
+    }
+
+    fn complete_token_in_scratch_buffer(&mut self) {
+        // Make the scratch buffer for the current token into the scratch
+        // buffer for a previous token.
+        std::mem::swap(
+            &mut self.scratch_buffer_for_a_previous_token,
+            &mut self.scratch_buffer_for_current_token,
+        );
+        self.scratch_buffer_for_current_token.clear();
+    }
+
+    pub fn next_token<'de, 't, DS>(
+        &'t mut self,
+        data_source: &'t mut DS,
+    ) -> Result<Option<RawToken<'de, 't>>, Error>
+    where
+        DS: DataSource<'de>,
+    {
+        while self.need_more_data_to_produce_tokens() {
+            match data_source.get_more_data() {
+                TokenizerData::Data(buffer) => self.process_more_data(buffer),
+                TokenizerData::Eof => self.eof(),
+            }
+        }
+
+        match self.raw_token_refs.pop_front() {
+            None => Ok(None),
+            Some(Err(error)) => Err(error),
+            Some(Ok(raw_token_ref)) => {
+                let raw_token = match raw_token_ref {
+                    RawTokenRef::LeftParen => RawToken::LeftParen,
+                    RawTokenRef::RightParen => RawToken::RightParen,
+                    RawTokenRef::SexpComment => RawToken::SexpComment,
+                    RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
+                        let raw_token_bytes = match raw_token_ref_data {
+                            RawTokenRefData::Scratch => TokenBytes::Transient(
+                                self.scratch_buffer_for_a_previous_token.as_slice(),
+                            ),
+                            RawTokenRefData::Range(range) => match data_source.get_buffer() {
+                                TokenBytes::Borrowed(buf) => TokenBytes::Borrowed(&buf[range]),
+                                TokenBytes::Transient(buf) => TokenBytes::Transient(&buf[range]),
+                            },
+                        };
+
+                        RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
+                    }
+                };
+
+                Ok(Some(raw_token))
+            }
         }
     }
 
-    pub fn iter_raw_token_fragments<'st, 'de>(
-        &'st mut self,
-        mut buffer: &'de [u8],
-    ) -> impl Iterator<Item = Result<RawTokenFragment, Error>> {
+    pub fn process_more_data(&mut self, mut buffer: &[u8]) {
         // Immediately return if no data to process
         if buffer.is_empty() {
-            return vec![].into_iter();
+            return;
         }
 
-        let mut tokens = vec![];
+        let Some(previous_state) = self.state else {
+            self.raw_token_refs
+                .push_back(Err(Error::TriedToProcessMoreDataAfterEof));
+            return;
+        };
 
         // Handle leftover state and possibly emit a token for the last character
         // we saw, based on peeking at the next char.
-        if self.state == TokenizationState::PoundSign {
+        if previous_state == TokenizationState::PoundSign {
             match buffer[0] {
                 b';' => {
-                    tokens.push(Ok(RawTokenFragment::SexpComment));
+                    self.raw_token_refs.push_back(Ok(RawTokenRef::SexpComment));
                     // Don't process ';' again
                     buffer = &buffer[1..];
-                    self.state = TokenizationState::Start;
+                    self.state = Some(TokenizationState::Start);
                 }
                 b'|' => {
-                    tokens.push(Ok(RawTokenFragment::StartOfToken(
-                        0..0,
-                        VarTokenKind::BlockComment,
-                    )));
-                    tokens.push(Ok(RawTokenFragment::ByteOfToken(b'#')));
-                    self.state = TokenizationState::BlockComment;
+                    self.state = Some(TokenizationState::BlockComment);
                     self.block_comment_depth = 1;
-                    self.already_emitted_start_of_current_token = true;
                 }
                 _ => {
-                    tokens.push(Ok(RawTokenFragment::StartOfToken(0..0, VarTokenKind::Atom)));
-                    tokens.push(Ok(RawTokenFragment::ByteOfToken(b'#')));
-                    self.state = TokenizationState::InUnquotedAtomPoundSign;
-                    self.already_emitted_start_of_current_token = true;
+                    // We already know that `buffer[0]` isn't a '|', so there's no chance of us
+                    // seeing one and returning a `BlockCommentStartTokenInUnquotedAtom` error.
+                    self.state = Some(TokenizationState::InUnquotedAtomPoundSign);
                 }
             }
         }
@@ -251,16 +323,13 @@ impl StreamingFragmentTokenizer {
         self.start_of_current_token = 0;
 
         for (pos, ch) in buffer.iter().enumerate() {
-            eprintln!(
-                "iter {}: ch {:?}, state: {:?}",
-                pos, *ch as char, self.state
-            );
-            match self.state {
+            // We only ever set `self.state` to `None` in `eof`.
+            match self.state.unwrap() {
                 TokenizationState::Start => match *ch {
                     whitespace!() => (),
-                    b'(' => tokens.push(Ok(RawTokenFragment::LeftParen)),
-                    b')' => tokens.push(Ok(RawTokenFragment::RightParen)),
-                    b'\r' => self.state = TokenizationState::CarriageReturn,
+                    b'(' => self.raw_token_refs.push_back(Ok(RawTokenRef::LeftParen)),
+                    b')' => self.raw_token_refs.push_back(Ok(RawTokenRef::RightParen)),
+                    b'\r' => self.state = Some(TokenizationState::CarriageReturn),
                     b'"' => self.start_new_token(pos, TokenizationState::InQuotedAtom),
                     b';' => self.start_new_token(pos, TokenizationState::LineComment),
                     b'#' => self.start_new_token(pos, TokenizationState::PoundSign),
@@ -269,10 +338,13 @@ impl StreamingFragmentTokenizer {
                 },
                 TokenizationState::CarriageReturn => {
                     if *ch != b'\n' {
-                        tokens.push(Err(Error::NakedCarriageReturn));
-                        return tokens.into_iter();
+                        self.raw_token_refs
+                            .push_back(Err(Error::NakedCarriageReturn));
+                        // Someday: Make `state` be `Eof`, `Error` or `Some`.
+                        self.state = None;
+                        return;
                     }
-                    self.state = TokenizationState::Start;
+                    self.state = Some(TokenizationState::Start);
                 }
                 TokenizationState::InUnquotedAtom
                 | TokenizationState::InUnquotedAtomPoundSign
@@ -280,175 +352,206 @@ impl StreamingFragmentTokenizer {
                 | TokenizationState::PoundSign
                 | TokenizationState::Bar => match *ch {
                     whitespace!() => {
-                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
-                        self.state = TokenizationState::Start;
+                        self.finish_token(VarTokenKind::Atom, pos, buffer);
+                        self.state = Some(TokenizationState::Start);
                     }
                     b'(' => {
-                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
-                        tokens.push(Ok(RawTokenFragment::LeftParen));
-                        self.state = TokenizationState::Start;
+                        self.finish_token(VarTokenKind::Atom, pos, buffer);
+                        self.raw_token_refs.push_back(Ok(RawTokenRef::LeftParen));
+                        self.state = Some(TokenizationState::Start);
                     }
                     b')' => {
-                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
-                        tokens.push(Ok(RawTokenFragment::RightParen));
-                        self.state = TokenizationState::Start;
+                        self.finish_token(VarTokenKind::Atom, pos, buffer);
+                        self.raw_token_refs.push_back(Ok(RawTokenRef::RightParen));
+                        self.state = Some(TokenizationState::Start);
                     }
                     b'\r' => {
-                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
-                        self.state = TokenizationState::CarriageReturn;
+                        self.finish_token(VarTokenKind::Atom, pos, buffer);
+                        self.state = Some(TokenizationState::CarriageReturn);
                     }
                     b'"' => {
-                        self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
+                        self.finish_token(VarTokenKind::Atom, pos, buffer);
                         self.start_new_token(pos, TokenizationState::InQuotedAtom);
                     }
-                    b';' => match self.state {
+                    b';' => match self.state.unwrap() {
                         TokenizationState::PoundSign => {
-                            tokens.push(Ok(RawTokenFragment::SexpComment));
-                            self.state = TokenizationState::Start;
+                            self.raw_token_refs.push_back(Ok(RawTokenRef::SexpComment));
+                            self.state = Some(TokenizationState::Start);
                         }
                         _ => {
-                            self.finish_token(VarTokenKind::Atom, pos, &mut tokens);
+                            self.finish_token(VarTokenKind::Atom, pos, buffer);
                             self.start_new_token(pos, TokenizationState::LineComment);
                         }
                     },
-                    b'#' => match self.state {
+                    b'#' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomBar => {
-                            tokens.push(Err(Error::BlockCommentEndTokenInUnquotedAtom));
-                            return tokens.into_iter();
+                            self.raw_token_refs
+                                .push_back(Err(Error::BlockCommentEndTokenInUnquotedAtom));
+                            self.state = None;
+                            return;
                         }
                         TokenizationState::Bar => {
-                            tokens.push(Err(Error::UnexpectedEndOfBlockComment));
-                            return tokens.into_iter();
+                            self.raw_token_refs
+                                .push_back(Err(Error::UnexpectedEndOfBlockComment));
+                            self.state = None;
+                            return;
                         }
-                        _ => self.state = TokenizationState::InUnquotedAtomPoundSign,
+                        _ => self.state = Some(TokenizationState::InUnquotedAtomPoundSign),
                     },
-                    b'|' => match self.state {
+                    b'|' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomPoundSign => {
-                            tokens.push(Err(Error::BlockCommentStartTokenInUnquotedAtom));
-                            return tokens.into_iter();
+                            self.raw_token_refs
+                                .push_back(Err(Error::BlockCommentStartTokenInUnquotedAtom));
+                            self.state = None;
+                            return;
                         }
                         TokenizationState::PoundSign => {
-                            self.state = TokenizationState::BlockComment;
+                            self.state = Some(TokenizationState::BlockComment);
                             self.block_comment_depth = 1;
                         }
-                        _ => self.state = TokenizationState::InUnquotedAtomBar,
+                        _ => self.state = Some(TokenizationState::InUnquotedAtomBar),
                     },
-                    _ => self.state = TokenizationState::InUnquotedAtom,
+                    _ => self.state = Some(TokenizationState::InUnquotedAtom),
                 },
                 // Processing quoted atoms and quoted strings in block comments is the same
                 // (other than what state we return to after the '"' or escaped character).
                 TokenizationState::InQuotedAtom | TokenizationState::BlockCommentInQuotedString => {
                     match *ch {
                         b'"' => {
-                            if self.state == TokenizationState::InQuotedAtom {
-                                self.finish_token(VarTokenKind::Atom, pos + 1, &mut tokens);
-                                self.state = TokenizationState::Start;
+                            if self.state.unwrap() == TokenizationState::InQuotedAtom {
+                                self.finish_token(VarTokenKind::Atom, pos + 1, buffer);
+                                self.state = Some(TokenizationState::Start);
                             } else {
-                                self.state = TokenizationState::BlockComment;
+                                self.state = Some(TokenizationState::BlockComment);
                             }
                         }
                         b'\\' => {
-                            if self.state == TokenizationState::InQuotedAtom {
-                                self.state = TokenizationState::InQuotedAtomEscape;
+                            if self.state.unwrap() == TokenizationState::InQuotedAtom {
+                                self.state = Some(TokenizationState::InQuotedAtomEscape);
                             } else {
-                                self.state = TokenizationState::BlockCommentInQuotedStringEscape;
+                                self.state =
+                                    Some(TokenizationState::BlockCommentInQuotedStringEscape);
                             }
                         }
                         _ => (),
                     }
                 }
                 TokenizationState::InQuotedAtomEscape => {
-                    self.state = TokenizationState::InQuotedAtom;
+                    self.state = Some(TokenizationState::InQuotedAtom);
                 }
                 TokenizationState::BlockCommentInQuotedStringEscape => {
-                    self.state = TokenizationState::BlockCommentInQuotedString;
+                    self.state = Some(TokenizationState::BlockCommentInQuotedString);
                 }
                 TokenizationState::LineComment => match *ch {
                     b'\n' => {
-                        self.finish_token(VarTokenKind::LineComment, pos, &mut tokens);
-                        self.state = TokenizationState::Start;
+                        self.finish_token(VarTokenKind::LineComment, pos, buffer);
+                        self.state = Some(TokenizationState::Start);
                     }
                     b'\r' => {
-                        self.finish_token(VarTokenKind::LineComment, pos, &mut tokens);
-                        self.state = TokenizationState::CarriageReturn;
+                        self.finish_token(VarTokenKind::LineComment, pos, buffer);
+                        self.state = Some(TokenizationState::CarriageReturn);
                     }
                     _ => (),
                 },
                 TokenizationState::BlockComment => match *ch {
-                    b'"' => self.state = TokenizationState::BlockCommentInQuotedString,
-                    b'#' => self.state = TokenizationState::BlockCommentPoundSign,
-                    b'|' => self.state = TokenizationState::BlockCommentBar,
+                    b'"' => self.state = Some(TokenizationState::BlockCommentInQuotedString),
+                    b'#' => self.state = Some(TokenizationState::BlockCommentPoundSign),
+                    b'|' => self.state = Some(TokenizationState::BlockCommentBar),
                     _ => (),
                 },
                 TokenizationState::BlockCommentPoundSign => match *ch {
-                    b'"' => self.state = TokenizationState::BlockCommentInQuotedString,
-                    b'#' => self.state = TokenizationState::BlockCommentPoundSign,
+                    b'"' => self.state = Some(TokenizationState::BlockCommentInQuotedString),
+                    b'#' => self.state = Some(TokenizationState::BlockCommentPoundSign),
                     b'|' => {
                         self.block_comment_depth += 1;
-                        self.state = TokenizationState::BlockComment;
+                        self.state = Some(TokenizationState::BlockComment);
                     }
-                    _ => self.state = TokenizationState::BlockComment,
+                    _ => self.state = Some(TokenizationState::BlockComment),
                 },
                 TokenizationState::BlockCommentBar => match *ch {
-                    b'"' => self.state = TokenizationState::BlockCommentInQuotedString,
-                    b'|' => self.state = TokenizationState::BlockCommentBar,
+                    b'"' => self.state = Some(TokenizationState::BlockCommentInQuotedString),
+                    b'|' => self.state = Some(TokenizationState::BlockCommentBar),
                     b'#' => {
                         self.block_comment_depth -= 1;
                         if self.block_comment_depth == 0 {
-                            self.finish_token(VarTokenKind::BlockComment, pos + 1, &mut tokens);
-                            self.state = TokenizationState::Start;
+                            self.finish_token(VarTokenKind::BlockComment, pos + 1, buffer);
+                            self.state = Some(TokenizationState::Start);
                         } else {
-                            self.state = TokenizationState::BlockComment;
+                            self.state = Some(TokenizationState::BlockComment);
                         }
                     }
-                    _ => self.state = TokenizationState::BlockComment,
+                    _ => self.state = Some(TokenizationState::BlockComment),
                 },
             }
         }
 
-        eprintln!("Done with buffer, state: {:?}", self.state);
-
         // If in the middle of a token, output `StartOfToken` or `MiddleOfToken`.
-        match self.state {
+        match self.state.unwrap() {
             TokenizationState::Start | TokenizationState::CarriageReturn => (),
-            // We *don't* write a `StartOfToken` in this state, since we don't
-            // know yet if it's a block comment, sexp comment, or a regular atom.
-            TokenizationState::PoundSign => (),
-            // These are all the start of an atom
-            TokenizationState::InUnquotedAtom
+            // Maybe starting an atom; it's fine if we don't end up using this.
+            TokenizationState::PoundSign
+            // Starting an atom
+            | TokenizationState::InUnquotedAtom
             | TokenizationState::InUnquotedAtomPoundSign
             | TokenizationState::InUnquotedAtomBar
             | TokenizationState::Bar
             | TokenizationState::InQuotedAtom
-            | TokenizationState::InQuotedAtomEscape => {
-                self.start_or_continue_token(VarTokenKind::Atom, buffer, &mut tokens);
-            }
+            | TokenizationState::InQuotedAtomEscape
             // Started a line comment
-            TokenizationState::LineComment => {
-                self.start_or_continue_token(VarTokenKind::LineComment, buffer, &mut tokens);
-            }
-            TokenizationState::BlockComment
+            | TokenizationState::LineComment
+            // Started a block comment
+            | TokenizationState::BlockComment
             | TokenizationState::BlockCommentPoundSign
             | TokenizationState::BlockCommentBar
             | TokenizationState::BlockCommentInQuotedString
             | TokenizationState::BlockCommentInQuotedStringEscape => {
-                self.start_or_continue_token(VarTokenKind::BlockComment, buffer, &mut tokens);
+                self.copy_partial_token_to_scratch_buffer(buffer);
             }
         }
-
-        tokens.into_iter()
     }
 
-    pub fn eof(self) -> Result<Option<RawTokenFragment>, Error> {
-        match self.state {
-            TokenizationState::Start => Ok(None),
-            TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn),
+    pub fn eof(&mut self) {
+        // Set `self.state` to `None`, indicating that we've seen EOF.
+        let Some(final_state) = self.state.take() else {
+            self.raw_token_refs
+                .push_back(Err(Error::EofCalledMultipleTimes));
+            return;
+        };
+
+        // If we push a new token when we see EOF, that will always be contained
+        // in the scratch buffer.
+        let raw_token_ref_data = RawTokenRefData::Scratch;
+
+        let final_token_ref = match final_state {
+            TokenizationState::Start => return,
             TokenizationState::InUnquotedAtom
             | TokenizationState::InUnquotedAtomBar
             | TokenizationState::InUnquotedAtomPoundSign
-            | TokenizationState::Bar
-            | TokenizationState::LineComment => Ok(Some(RawTokenFragment::EndOfToken)),
-            TokenizationState::PoundSign => Ok(Some(RawTokenFragment::SinglePoundSignAtom)),
+            | TokenizationState::Bar => {
+                assert!(self.using_scratch_buffer_for_current_token);
+                self.complete_token_in_scratch_buffer();
+                Ok(RawTokenRef::VarToken(
+                    raw_token_ref_data,
+                    VarTokenKind::Atom,
+                ))
+            }
+            TokenizationState::LineComment => {
+                assert!(self.using_scratch_buffer_for_current_token);
+                self.complete_token_in_scratch_buffer();
+                Ok(RawTokenRef::VarToken(
+                    raw_token_ref_data,
+                    VarTokenKind::LineComment,
+                ))
+            }
+            TokenizationState::PoundSign => {
+                assert!(self.using_scratch_buffer_for_current_token);
+                self.complete_token_in_scratch_buffer();
+                Ok(RawTokenRef::VarToken(
+                    raw_token_ref_data,
+                    VarTokenKind::Atom,
+                ))
+            }
+            TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn),
             TokenizationState::InQuotedAtom | TokenizationState::InQuotedAtomEscape => {
                 Err(Error::UnexpectedEofWhileInInQuotedAtom)
             }
@@ -459,115 +562,9 @@ impl StreamingFragmentTokenizer {
             | TokenizationState::BlockCommentInQuotedStringEscape => {
                 Err(Error::UnexpectedEofWhileInBlockComment)
             }
-        }
-    }
-}
+        };
 
-pub struct StreamingTokenizer {
-    fragment_tokenizer: StreamingFragmentTokenizer,
-    current_reconstructed_token: Option<(Vec<u8>, VarTokenKind)>,
-}
-
-impl StreamingTokenizer {
-    pub fn new() -> StreamingTokenizer {
-        StreamingTokenizer {
-            fragment_tokenizer: StreamingFragmentTokenizer::new(),
-            current_reconstructed_token: None,
-        }
-    }
-
-    pub fn iter_raw_tokens<'st, 'de>(
-        &'st mut self,
-        buffer: &'de [u8],
-    ) -> impl Iterator<Item = Result<RawToken<'de>, Error>> {
-        let mut tokens = vec![];
-
-        for raw_token_fragment in self.fragment_tokenizer.iter_raw_token_fragments(buffer) {
-            match raw_token_fragment {
-                Err(error) => tokens.push(Err(error)),
-                Ok(RawTokenFragment::LeftParen) => tokens.push(Ok(RawToken::LeftParen)),
-                Ok(RawTokenFragment::RightParen) => tokens.push(Ok(RawToken::RightParen)),
-                Ok(RawTokenFragment::SexpComment) => tokens.push(Ok(RawToken::SexpComment)),
-                Ok(RawTokenFragment::FullToken(range, kind)) => {
-                    let data = Cow::Borrowed(&buffer[range]);
-                    let token = RawToken::from_data_and_kind(data, kind);
-                    tokens.push(Ok(token));
-                }
-                Ok(RawTokenFragment::StartOfToken(range, kind)) => {
-                    if self.current_reconstructed_token.is_some() {
-                        tokens.push(Err(Error::UnexpectedTokenStartStillProcessingPreviousToken));
-                        return tokens.into_iter();
-                    }
-
-                    let fragment = &buffer[range];
-                    self.current_reconstructed_token = Some((fragment.to_vec(), kind));
-                }
-                Ok(RawTokenFragment::MiddleOfToken(range)) => {
-                    let Some((token_data, _)) = &mut self.current_reconstructed_token else {
-                        tokens.push(Err(Error::UnexpectedTokenContinuation));
-                        return tokens.into_iter();
-                    };
-
-                    let fragment = &buffer[range];
-                    token_data.extend_from_slice(fragment);
-                }
-                Ok(RawTokenFragment::ByteOfToken(b)) => {
-                    let Some((token_data, _)) = &mut self.current_reconstructed_token else {
-                        tokens.push(Err(Error::UnexpectedTokenContinuation));
-                        return tokens.into_iter();
-                    };
-
-                    token_data.push(b);
-                }
-                Ok(RawTokenFragment::EndOfToken) => {
-                    let Some((token_data, kind)) = self.current_reconstructed_token.take() else {
-                        tokens.push(Err(Error::UnexpectedTokenContinuation));
-                        return tokens.into_iter();
-                    };
-
-                    tokens.push(Ok(RawToken::from_data_and_kind(
-                        Cow::Owned(token_data),
-                        kind,
-                    )));
-                }
-                Ok(RawTokenFragment::SinglePoundSignAtom) => {
-                    tokens.push(Ok(RawToken::Atom(Cow::Borrowed(b"#"))))
-                }
-            }
-        }
-
-        tokens.into_iter()
-    }
-
-    pub fn eof(self) -> Result<Option<RawToken<'static>>, Error> {
-        match self.fragment_tokenizer.eof() {
-            Err(error) => Err(error),
-            Ok(None) => Ok(None),
-            Ok(Some(raw_token_fragment)) => match raw_token_fragment {
-                RawTokenFragment::LeftParen => Ok(Some(RawToken::LeftParen)),
-                RawTokenFragment::RightParen => Ok(Some(RawToken::RightParen)),
-                RawTokenFragment::SexpComment => Ok(Some(RawToken::SexpComment)),
-                RawTokenFragment::FullToken(_, _)
-                | RawTokenFragment::StartOfToken(_, _)
-                | RawTokenFragment::MiddleOfToken(_)
-                | RawTokenFragment::ByteOfToken(_) => {
-                    Err(Error::UnexpectedEofWhileConstructingTokenFragments)
-                }
-                RawTokenFragment::EndOfToken => {
-                    let Some((token_data, kind)) = self.current_reconstructed_token else {
-                        return Err(Error::UnexpectedTokenContinuation);
-                    };
-
-                    Ok(Some(RawToken::from_data_and_kind(
-                        Cow::Owned(token_data),
-                        kind,
-                    )))
-                }
-                RawTokenFragment::SinglePoundSignAtom => {
-                    Ok(Some(RawToken::Atom(Cow::Borrowed(b"#"))))
-                }
-            },
-        }
+        self.raw_token_refs.push_back(final_token_ref);
     }
 }
 
@@ -580,461 +577,327 @@ mod tests {
     use bstr::ByteSlice;
     use insta::assert_snapshot;
 
+    struct StaticFragments(Vec<&'static [u8]>, Option<&'static [u8]>);
+
+    impl<'a> DataSource<'a> for StaticFragments {
+        fn get_more_data(&mut self) -> TokenizerData<'_> {
+            match self.0.pop() {
+                None => {
+                    self.1 = None;
+                    TokenizerData::Eof
+                }
+                Some(buf) => {
+                    self.1 = Some(buf);
+                    TokenizerData::Data(buf)
+                }
+            }
+        }
+
+        fn get_buffer<'s>(&'s self) -> TokenBytes<'a, 's> {
+            TokenBytes::Borrowed(self.1.unwrap())
+        }
+    }
+
+    fn tokenize_fragments(buffers: &[&'static [u8]]) -> String {
+        let mut fragments = buffers.to_vec();
+        fragments.reverse();
+
+        let mut data_source = StaticFragments(fragments, None);
+        let mut tokenizer = Tokenizer::new();
+
+        let mut output = String::new();
+        let o = &mut output;
+
+        loop {
+            let _ = match tokenizer.next_token(&mut data_source) {
+                Ok(None) => break,
+                Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
+                Err(err) => writeln!(o, "{}", format_error(err)),
+            };
+        }
+
+        return output;
+    }
+
+    fn tokenize_str(buffer: &'static [u8]) -> String {
+        tokenize_fragments(&[buffer])
+    }
+
     fn format_error(err: Error) -> String {
         format!("ERROR: {:?}", err)
     }
 
-    fn format_raw_token_fragment(token: RawTokenFragment, buffer: &[u8]) -> String {
-        match token {
-            RawTokenFragment::LeftParen => "LeftParen: (".to_owned(),
-            RawTokenFragment::RightParen => "RightParen: )".to_owned(),
-            RawTokenFragment::SexpComment => "SexpComment: #;".to_owned(),
-            RawTokenFragment::FullToken(range, kind) => {
-                let fragment = &buffer[range];
-                format!("{:?}: {:?}", kind, fragment.as_bstr())
-            }
-            RawTokenFragment::StartOfToken(range, kind) => {
-                let fragment = &buffer[range];
-                format!("Start of {:?}: {:?}", kind, fragment.as_bstr())
-            }
-            RawTokenFragment::MiddleOfToken(range) => {
-                let fragment = &buffer[range];
-                format!("Middle of token: {:?}", fragment.as_bstr())
-            }
-            RawTokenFragment::ByteOfToken(b) => {
-                let buf = [b];
-                format!("Byte of token: {:?}", &buf.as_bstr())
-            }
-            RawTokenFragment::EndOfToken => "End of token".to_string(),
-            RawTokenFragment::SinglePoundSignAtom => "SinglePoundSignAtom: \"#\"".to_string(),
-        }
-    }
-
-    fn write_raw_token_fragments(
-        tokenizer: &mut StreamingFragmentTokenizer,
-        buffer: &[u8],
-    ) -> String {
-        let mut output = String::new();
-        let o = &mut output;
-
-        for token in tokenizer.iter_raw_token_fragments(buffer) {
-            let _ = match token {
-                Err(err) => writeln!(o, "{}", format_error(err)),
-                Ok(token) => writeln!(o, "{}", format_raw_token_fragment(token, buffer)),
-            };
-        }
-
-        output
-    }
-
-    fn raw_fragments(buffer: &[u8]) -> String {
-        let mut tokenizer = StreamingFragmentTokenizer::new();
-        write_raw_token_fragments(&mut tokenizer, buffer)
-    }
-
-    fn streamed_fragments(buffers: &[&[u8]]) -> String {
-        let mut tokenizer = StreamingFragmentTokenizer::new();
-        let mut fragments = buffers
-            .iter()
-            .map(|buf| write_raw_token_fragments(&mut tokenizer, buf))
-            .collect::<Vec<_>>();
-
-        match tokenizer.eof() {
-            Ok(None) => (),
-            Ok(Some(token)) =>
-            // Token returned by `eof` should never reference the buffer, so this is fine.
-            {
-                fragments.push(format_raw_token_fragment(token, b""))
-            }
-            Err(err) => fragments.push(format!("ERROR: {:?}", err)),
-        }
-
-        fragments.join("---\n")
-    }
-
-    fn format_raw_token(token: Result<RawToken<'_>, Error>) -> String {
-        fn borrowed_or_owned(cow: &Cow<'_, [u8]>) -> &'static str {
-            match cow {
-                Cow::Borrowed(_) => "borrowed",
-                Cow::Owned(_) => "owned",
+    fn format_raw_token<'de, 't>(raw_token: RawToken<'de, 't>) -> String {
+        fn borrowed_or_owned(token_bytes: &TokenBytes<'_, '_>) -> &'static str {
+            match token_bytes {
+                TokenBytes::Borrowed(_) => "borrowed",
+                TokenBytes::Transient(_) => "transient",
             }
         }
 
-        let token = match token {
-            Err(err) => return format_error(err),
-            Ok(token) => token,
-        };
-
-        match token {
+        match raw_token {
             RawToken::LeftParen => "LeftParen: (".to_owned(),
             RawToken::RightParen => "RightParen: )".to_owned(),
             RawToken::SexpComment => "SexpComment: #;".to_owned(),
-            RawToken::Atom(atom) => {
-                format!("Atom: {:?} ({})", atom.as_bstr(), borrowed_or_owned(&atom))
+            RawToken::Atom(token_bytes) => {
+                let ref_kind = borrowed_or_owned(&token_bytes);
+                let bytes = token_bytes.bytes().as_bstr();
+                format!("Atom: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::LineComment(line_comment) => {
-                format!(
-                    "LineComment: {:?} ({})",
-                    line_comment.as_bstr(),
-                    borrowed_or_owned(&line_comment)
-                )
+            RawToken::LineComment(token_bytes) => {
+                let ref_kind = borrowed_or_owned(&token_bytes);
+                let bytes = token_bytes.bytes().as_bstr();
+                format!("LineComment: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::BlockComment(block_comment) => {
-                format!(
-                    "BlockComment: {:?} ({})",
-                    block_comment.as_bstr(),
-                    borrowed_or_owned(&block_comment)
-                )
+            RawToken::BlockComment(token_bytes) => {
+                let ref_kind = borrowed_or_owned(&token_bytes);
+                let bytes = token_bytes.bytes().as_bstr();
+                format!("BlockComment: {:?} ({})", bytes, ref_kind)
             }
         }
-    }
-
-    fn streamed_tokens(buffers: &[&[u8]]) -> String {
-        let mut tokenizer = StreamingTokenizer::new();
-        let mut tokens = vec![];
-
-        for buffer in buffers {
-            tokens.extend(tokenizer.iter_raw_tokens(buffer));
-        }
-
-        match tokenizer.eof() {
-            Ok(None) => (),
-            Ok(Some(token)) => tokens.push(Ok(token)),
-            Err(err) => tokens.push(Err(err)),
-        }
-
-        tokens
-            .into_iter()
-            .map(format_raw_token)
-            .collect::<Vec<_>>()
-            .join("\n---\n")
     }
 
     #[test]
     fn test_basics() {
-        assert_snapshot!(raw_fragments(b"a bc 123 "), @r#"
-        Atom: "a"
-        Atom: "bc"
-        Atom: "123"
+        assert_snapshot!(tokenize_str(b"a bc 123 "), @r#"
+        Atom: "a" (borrowed)
+        Atom: "bc" (borrowed)
+        Atom: "123" (borrowed)
         "#);
 
-        assert_snapshot!(raw_fragments(b"a\"123\"b \"\""), @r#"
-        Atom: "a"
-        Atom: "\"123\""
-        Atom: "b"
-        Atom: "\"\""
+        assert_snapshot!(tokenize_str(b"a\"123\"b \"\""), @r#"
+        Atom: "a" (borrowed)
+        Atom: "\"123\"" (borrowed)
+        Atom: "b" (borrowed)
+        Atom: "\"\"" (borrowed)
         "#);
 
-        assert_snapshot!(raw_fragments(b"## #a #( #) #\"#\" #\r\n#\n| #;|\n# "), @r###"
-        Atom: "##"
-        Atom: "#a"
-        Atom: "#"
+        assert_snapshot!(tokenize_str(b"## #a #( #) #\"#\" #\r\n#\n| #;|\n# "), @r###"
+        Atom: "##" (borrowed)
+        Atom: "#a" (borrowed)
+        Atom: "#" (borrowed)
         LeftParen: (
-        Atom: "#"
+        Atom: "#" (borrowed)
         RightParen: )
-        Atom: "#"
-        Atom: "\"#\""
-        Atom: "#"
-        Atom: "#"
-        Atom: "|"
+        Atom: "#" (borrowed)
+        Atom: "\"#\"" (borrowed)
+        Atom: "#" (borrowed)
+        Atom: "#" (borrowed)
+        Atom: "|" (borrowed)
         SexpComment: #;
-        Atom: "|"
-        Atom: "#"
+        Atom: "|" (borrowed)
+        Atom: "#" (borrowed)
         "###);
 
-        assert_snapshot!(raw_fragments(b"z#a z#( z#) z#\"#\" z#\r\nz#\n| z#;|\n"), @r##"
-        Atom: "z#a"
-        Atom: "z#"
+        assert_snapshot!(tokenize_str(b"z#a z#( z#) z#\"#\" z#\r\nz#\n| z#;|\n"), @r##"
+        Atom: "z#a" (borrowed)
+        Atom: "z#" (borrowed)
         LeftParen: (
-        Atom: "z#"
+        Atom: "z#" (borrowed)
         RightParen: )
-        Atom: "z#"
-        Atom: "\"#\""
-        Atom: "z#"
-        Atom: "z#"
-        Atom: "|"
-        Atom: "z#"
-        LineComment: ";|"
+        Atom: "z#" (borrowed)
+        Atom: "\"#\"" (borrowed)
+        Atom: "z#" (borrowed)
+        Atom: "z#" (borrowed)
+        Atom: "|" (borrowed)
+        Atom: "z#" (borrowed)
+        LineComment: ";|" (borrowed)
         "##);
 
-        assert_snapshot!(raw_fragments(b"|| |a |( |) |\"|\" |\r\n|\n# |;|\n| "), @r##"
-        Atom: "||"
-        Atom: "|a"
-        Atom: "|"
+        assert_snapshot!(tokenize_str(b"|| |a |( |) |\"|\" |\r\n|\n# |;|\n| "), @r##"
+        Atom: "||" (borrowed)
+        Atom: "|a" (borrowed)
+        Atom: "|" (borrowed)
         LeftParen: (
-        Atom: "|"
+        Atom: "|" (borrowed)
         RightParen: )
-        Atom: "|"
-        Atom: "\"|\""
-        Atom: "|"
-        Atom: "|"
-        Atom: "#"
-        Atom: "|"
-        LineComment: ";|"
-        Atom: "|"
+        Atom: "|" (borrowed)
+        Atom: "\"|\"" (borrowed)
+        Atom: "|" (borrowed)
+        Atom: "|" (borrowed)
+        Atom: "#" (borrowed)
+        Atom: "|" (borrowed)
+        LineComment: ";|" (borrowed)
+        Atom: "|" (borrowed)
         "##);
 
-        assert_snapshot!(raw_fragments(b"z|a z|( z|) z|\"|\" z|\r\nz|\n# z|;|\n"), @r##"
-        Atom: "z|a"
-        Atom: "z|"
+        assert_snapshot!(tokenize_str(b"z|a z|( z|) z|\"|\" z|\r\nz|\n# z|;|\n"), @r##"
+        Atom: "z|a" (borrowed)
+        Atom: "z|" (borrowed)
         LeftParen: (
-        Atom: "z|"
+        Atom: "z|" (borrowed)
         RightParen: )
-        Atom: "z|"
-        Atom: "\"|\""
-        Atom: "z|"
-        Atom: "z|"
-        Atom: "#"
-        Atom: "z|"
-        LineComment: ";|"
+        Atom: "z|" (borrowed)
+        Atom: "\"|\"" (borrowed)
+        Atom: "z|" (borrowed)
+        Atom: "z|" (borrowed)
+        Atom: "#" (borrowed)
+        Atom: "z|" (borrowed)
+        LineComment: ";|" (borrowed)
         "##);
     }
 
     #[test]
     fn test_quoted_string_escapes() {
         assert_snapshot!(
-            raw_fragments(b"\"\\\n \\n \\123 \\\\ \\x01 \\x0\""),
-            @r#"Atom: "\"\\\n \\n \\123 \\\\ \\x01 \\x0\"""#);
+            tokenize_str(b"\"\\\n \\n \\123 \\\\ \\x01 \\x0\""),
+            @r#"Atom: "\"\\\n \\n \\123 \\\\ \\x01 \\x0\"" (borrowed)"#);
     }
 
     #[test]
     fn test_line_comments() {
         assert_snapshot!(
-            raw_fragments(b";\"\"\n;abc\r\n;\n "),
+            tokenize_str(b";\"\"\n;abc\r\n;\n "),
             @r#"
-        LineComment: ";\"\""
-        LineComment: ";abc"
-        LineComment: ";"
+        LineComment: ";\"\"" (borrowed)
+        LineComment: ";abc" (borrowed)
+        LineComment: ";" (borrowed)
         "#);
     }
 
     #[test]
     fn test_block_comments() {
         assert_snapshot!(
-            raw_fragments(b"#|a|# _ #|# |# _ #|\"|#\\\"\"|# _ #| #| a |#| |#"),
+            tokenize_str(b"#|a|# _ #|# |# _ #|\"|#\\\"\"|# _ #| #| a |#| |#"),
             @r##"
-        BlockComment: "#|a|#"
-        Atom: "_"
-        BlockComment: "#|# |#"
-        Atom: "_"
-        BlockComment: "#|\"|#\\\"\"|#"
-        Atom: "_"
-        BlockComment: "#| #| a |#| |#"
+        BlockComment: "#|a|#" (borrowed)
+        Atom: "_" (borrowed)
+        BlockComment: "#|# |#" (borrowed)
+        Atom: "_" (borrowed)
+        BlockComment: "#|\"|#\\\"\"|#" (borrowed)
+        Atom: "_" (borrowed)
+        BlockComment: "#| #| a |#| |#" (borrowed)
         "##,
         );
     }
 
     #[test]
     fn test_block_comment_errors() {
-        assert_snapshot!(raw_fragments(b"a#|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
-        assert_snapshot!(raw_fragments(b"a##|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
-        assert_snapshot!(raw_fragments(b"a|#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
-        assert_snapshot!(raw_fragments(b"a||#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
-        assert_snapshot!(raw_fragments(b"|#"), @"ERROR: UnexpectedEndOfBlockComment");
+        assert_snapshot!(tokenize_str(b"a#|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
+        assert_snapshot!(tokenize_str(b"a##|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
+        assert_snapshot!(tokenize_str(b"a|#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
+        assert_snapshot!(tokenize_str(b"a||#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
+        assert_snapshot!(tokenize_str(b"|#"), @"ERROR: UnexpectedEndOfBlockComment");
     }
 
     #[test]
     fn test_sexp_comments() {
-        assert_snapshot!(raw_fragments(b"#; a#;x\n##;y\n"), @r###"
+        assert_snapshot!(tokenize_str(b"#; a#;x\n##;y\n"), @r###"
         SexpComment: #;
-        Atom: "a#"
-        LineComment: ";x"
-        Atom: "##"
-        LineComment: ";y"
+        Atom: "a#" (borrowed)
+        LineComment: ";x" (borrowed)
+        Atom: "##" (borrowed)
+        LineComment: ";y" (borrowed)
         "###);
     }
 
     #[test]
     fn test_partial_tokens() {
         assert_snapshot!(
-            streamed_fragments(&[b"abc", b"", b"def", b"ghi "]),
-            @r#"
-        Start of Atom: "abc"
-        ---
-        ---
-        Middle of token: "def"
-        ---
-        Middle of token: "ghi"
-        End of token
-        "#,
+            tokenize_fragments(&[b"abc", b"", b"def", b"ghi "]),
+            @r#"Atom: "abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            streamed_fragments(&[b";abc", b"def", b"ghi\n"]),
-            @r#"
-        Start of LineComment: ";abc"
-        ---
-        Middle of token: "def"
-        ---
-        Middle of token: "ghi"
-        End of token
-        "#,
+            tokenize_fragments(&[b";abc", b"def", b"ghi\n"]),
+            @r#"LineComment: ";abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            streamed_fragments(&[b"#| abc", b"def", b"ghi |# "]),
-            @r##"
-        Start of BlockComment: "#| abc"
-        ---
-        Middle of token: "def"
-        ---
-        Middle of token: "ghi |#"
-        End of token
-        "##,
+            tokenize_fragments(&[b"#| abc", b"def", b"ghi |# "]),
+            @r##"BlockComment: "#| abcdefghi |#" (transient)"##,
         );
     }
 
     #[test]
     fn test_handling_of_pounds_across_buffers() {
+        // #;
+        // #| |#
+        // #a
+        // ##
         assert_snapshot!(
-            streamed_fragments(&[b"#", b"; #", b"| |# #", b"a #", b"# "]),
-            @r##"
-        ---
+            tokenize_fragments(&[b"#", b"; #", b"| |# #", b"a #", b"# "]),
+            @r###"
         SexpComment: #;
-        ---
-        Start of BlockComment: ""
-        Byte of token: "#"
-        Middle of token: "| |#"
-        End of token
-        ---
-        Start of Atom: ""
-        Byte of token: "#"
-        Middle of token: "a"
-        End of token
-        ---
-        Start of Atom: ""
-        Byte of token: "#"
-        Middle of token: "#"
-        End of token
-        "##,
+        BlockComment: "#| |#" (transient)
+        Atom: "#a" (transient)
+        Atom: "##" (transient)
+        "###,
         );
     }
 
     #[test]
     fn test_eof() {
-        assert_snapshot!(streamed_fragments(&[b"a\r"]), @r#"
-        Atom: "a"
-        ---
+        assert_snapshot!(tokenize_fragments(&[b"a\r"]), @r#"
+        Atom: "a" (borrowed)
         ERROR: NakedCarriageReturn
         "#);
 
-        assert_snapshot!(streamed_fragments(&[b"a"]), @r#"
-        Start of Atom: "a"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b"a"]), @r#"Atom: "a" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b"a|"]), @r#"
-        Start of Atom: "a|"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b"a|"]), @r#"Atom: "a|" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b"a#"]), @r#"
-        Start of Atom: "a#"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b"a#"]), @r#"Atom: "a#" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b"|"]), @r#"
-        Start of Atom: "|"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b"|"]), @r#"Atom: "|" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b";"]), @r#"
-        Start of LineComment: ";"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b";"]), @r#"
-        Start of LineComment: ";"
-        ---
-        End of token
-        "#);
+        assert_snapshot!(tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
 
-        assert_snapshot!(streamed_fragments(&[b"#"]), @r##"
-        ---
-        SinglePoundSignAtom: "#"
-        "##);
+        assert_snapshot!(tokenize_fragments(&[b"#"]), @r##"Atom: "#" (transient)"##);
     }
 
     #[test]
     fn test_eof_errors() {
-        assert_snapshot!(streamed_fragments(&[b"#|"]), @r##"
-        Start of BlockComment: "#|"
-        ---
-        ERROR: UnexpectedEofWhileInBlockComment
-        "##);
-        assert_snapshot!(streamed_fragments(&[b"#| #"]), @r##"
-        Start of BlockComment: "#| #"
-        ---
-        ERROR: UnexpectedEofWhileInBlockComment
-        "##);
-        assert_snapshot!(streamed_fragments(&[b"#| |"]), @r##"
-        Start of BlockComment: "#| |"
-        ---
-        ERROR: UnexpectedEofWhileInBlockComment
-        "##);
-        assert_snapshot!(streamed_fragments(&[b"#| \""]), @r##"
-        Start of BlockComment: "#| \""
-        ---
-        ERROR: UnexpectedEofWhileInBlockComment
-        "##);
-        assert_snapshot!(streamed_fragments(&[b"#| \"\\"]), @r##"
-        Start of BlockComment: "#| \"\\"
-        ---
-        ERROR: UnexpectedEofWhileInBlockComment
-        "##);
+        assert_snapshot!(tokenize_fragments(&[b"#|"]), @"ERROR: UnexpectedEofWhileInBlockComment");
+        assert_snapshot!(tokenize_fragments(&[b"#| #"]), @"ERROR: UnexpectedEofWhileInBlockComment");
+        assert_snapshot!(tokenize_fragments(&[b"#| |"]), @"ERROR: UnexpectedEofWhileInBlockComment");
+        assert_snapshot!(tokenize_fragments(&[b"#| \""]), @"ERROR: UnexpectedEofWhileInBlockComment");
+        assert_snapshot!(tokenize_fragments(&[b"#| \"\\"]), @"ERROR: UnexpectedEofWhileInBlockComment");
     }
 
     #[test]
     fn test_tokenizer() {
         assert_snapshot!(
-            streamed_tokens(&[b"a1 a2", b" a3"]),
+            tokenize_fragments(&[b"a1 a2", b" a3"]),
             @r#"
         Atom: "a1" (borrowed)
-        ---
-        Atom: "a2" (owned)
-        ---
-        Atom: "a3" (owned)
+        Atom: "a2" (transient)
+        Atom: "a3" (transient)
         "#,
         );
 
         assert_snapshot!(
-            streamed_tokens(&[b"abc", b"def", b"ghi"]),
-            @r#"Atom: "abcdefghi" (owned)"#,
+            tokenize_fragments(&[b"abc", b"def", b"ghi"]),
+            @r#"Atom: "abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            streamed_tokens(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
+            tokenize_fragments(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
             @r#"
         LineComment: "; lc1" (borrowed)
-        ---
-        LineComment: "; lc2" (owned)
-        ---
-        LineComment: "; lc3" (owned)
+        LineComment: "; lc2" (transient)
+        LineComment: "; lc3" (transient)
         "#,
         );
 
         assert_snapshot!(
-            streamed_tokens(&[b"; abc", b"def", b"ghi"]),
-            @r#"LineComment: "; abcdefghi" (owned)"#,
+            tokenize_fragments(&[b"; abc", b"def", b"ghi"]),
+            @r#"LineComment: "; abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            streamed_tokens(&[b"#| bc1 |# #| bc2 ", b"|#"]),
+            tokenize_fragments(&[b"#| bc1 |# #| bc2 ", b"|#"]),
             @r##"
         BlockComment: "#| bc1 |#" (borrowed)
-        ---
-        BlockComment: "#| bc2 |#" (owned)
+        BlockComment: "#| bc2 |#" (transient)
         "##,
         );
 
         assert_snapshot!(
-            streamed_tokens(&[b"#| abc", b"def", b"ghi |#"]),
-            @r##"BlockComment: "#| abcdefghi |#" (owned)"##,
+            tokenize_fragments(&[b"#| abc", b"def", b"ghi |#"]),
+            @r##"BlockComment: "#| abcdefghi |#" (transient)"##,
         );
     }
 }
