@@ -73,6 +73,69 @@ trait DataSource<'de> {
     fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's>;
 }
 
+struct SliceDataSource<'de> {
+    bytes: &'de [u8],
+    curr_offset: Option<usize>,
+    curr_window: &'de [u8],
+    window_size: usize,
+}
+
+const DEFAULT_WINDOW_SIZE: usize = 1024 * 1024; // 1 mb
+
+impl<'de> SliceDataSource<'de> {
+    fn new(bytes: &'de [u8]) -> Self {
+        Self::new_with_window_size(bytes, DEFAULT_WINDOW_SIZE)
+    }
+
+    fn new_with_window_size(bytes: &'de [u8], window_size: usize) -> Self {
+        if window_size == 0 {
+            panic!("window_size passed to SliceDataSource must be non-zero");
+        }
+
+        SliceDataSource {
+            bytes,
+            curr_offset: None,
+            curr_window: &bytes[0..0],
+            window_size,
+        }
+    }
+
+    fn set_current_window(&mut self, starting_at_offset: usize) {
+        self.curr_offset = Some(starting_at_offset);
+        let end = usize::min(starting_at_offset + self.window_size, self.bytes.len());
+        self.curr_window = &self.bytes[starting_at_offset..end];
+    }
+}
+
+impl<'de> DataSource<'de> for SliceDataSource<'de> {
+    fn get_more_data<'s>(&'s mut self) -> TokenizerData<'s> {
+        match self.curr_offset {
+            // Initial cases
+            None => {
+                if self.bytes.len() == 0 {
+                    // Degenerate case; input was empty
+                    TokenizerData::Eof
+                } else {
+                    self.set_current_window(0);
+                    TokenizerData::Data(self.curr_window)
+                }
+            }
+            Some(curr_offset) => {
+                if curr_offset + self.window_size >= self.bytes.len() {
+                    TokenizerData::Eof
+                } else {
+                    self.set_current_window(curr_offset + self.window_size);
+                    TokenizerData::Data(self.curr_window)
+                }
+            }
+        }
+    }
+
+    fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's> {
+        TokenBytes::Borrowed(self.curr_window)
+    }
+}
+
 #[derive(Debug)]
 enum RawTokenRefData {
     Range(Range<usize>),
@@ -594,7 +657,7 @@ mod tests {
         }
 
         fn get_buffer<'s>(&'s self) -> TokenBytes<'a, 's> {
-            TokenBytes::Borrowed(self.1.unwrap())
+            TokenBytes::Transient(self.1.unwrap())
         }
     }
 
@@ -619,8 +682,22 @@ mod tests {
         return output;
     }
 
-    fn tokenize_str(buffer: &'static [u8]) -> String {
-        tokenize_fragments(&[buffer])
+    fn tokenize_str(buffer: &[u8]) -> String {
+        let mut data_source = SliceDataSource::new(buffer);
+        let mut tokenizer = Tokenizer::new();
+
+        let mut output = String::new();
+        let o = &mut output;
+
+        loop {
+            let _ = match tokenizer.next_token(&mut data_source) {
+                Ok(None) => break,
+                Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
+                Err(err) => writeln!(o, "{}", format_error(err)),
+            };
+        }
+
+        return output;
     }
 
     fn format_error(err: Error) -> String {
@@ -829,7 +906,7 @@ mod tests {
     #[test]
     fn test_eof() {
         assert_snapshot!(tokenize_fragments(&[b"a\r"]), @r#"
-        Atom: "a" (borrowed)
+        Atom: "a" (transient)
         ERROR: NakedCarriageReturn
         "#);
 
@@ -862,7 +939,7 @@ mod tests {
         assert_snapshot!(
             tokenize_fragments(&[b"a1 a2", b" a3"]),
             @r#"
-        Atom: "a1" (borrowed)
+        Atom: "a1" (transient)
         Atom: "a2" (transient)
         Atom: "a3" (transient)
         "#,
@@ -876,7 +953,7 @@ mod tests {
         assert_snapshot!(
             tokenize_fragments(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
             @r#"
-        LineComment: "; lc1" (borrowed)
+        LineComment: "; lc1" (transient)
         LineComment: "; lc2" (transient)
         LineComment: "; lc3" (transient)
         "#,
@@ -890,7 +967,7 @@ mod tests {
         assert_snapshot!(
             tokenize_fragments(&[b"#| bc1 |# #| bc2 ", b"|#"]),
             @r##"
-        BlockComment: "#| bc1 |#" (borrowed)
+        BlockComment: "#| bc1 |#" (transient)
         BlockComment: "#| bc2 |#" (transient)
         "##,
         );
