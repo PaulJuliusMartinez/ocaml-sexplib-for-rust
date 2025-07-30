@@ -3,6 +3,8 @@
 #![allow(clippy::collapsible_else_if)]
 // Sometimes "x >= y + 1" is semantically clearer than "x > y"
 #![allow(clippy::int_plus_one)]
+// `is_empty` sometimes makes something too much like a collection.
+#![allow(clippy::len_zero)]
 
 mod atom;
 pub mod de;

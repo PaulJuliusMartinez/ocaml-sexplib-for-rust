@@ -24,10 +24,10 @@ enum TokenBytes<'de, 't> {
 }
 
 impl<'de, 't> TokenBytes<'de, 't> {
-    fn bytes<'a>(&'a self) -> &'a [u8] {
+    fn bytes(&self) -> &[u8] {
         match self {
-            TokenBytes::Borrowed(buf) => &*buf,
-            TokenBytes::Transient(buf) => &*buf,
+            TokenBytes::Borrowed(buf) => buf,
+            TokenBytes::Transient(buf) => buf,
         }
     }
 }
@@ -68,7 +68,7 @@ enum TokenizerData<'a> {
 
 trait DataSource<'de> {
     // Someday: This needs to return `io::Result`.
-    fn get_more_data<'s>(&'s mut self) -> TokenizerData<'s>;
+    fn get_more_data(&mut self) -> TokenizerData<'_>;
     // Someday: Better word than "buffer"?
     fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's>;
 }
@@ -108,7 +108,7 @@ impl<'de> SliceDataSource<'de> {
 }
 
 impl<'de> DataSource<'de> for SliceDataSource<'de> {
-    fn get_more_data<'s>(&'s mut self) -> TokenizerData<'s> {
+    fn get_more_data(&mut self) -> TokenizerData<'_> {
         match self.curr_offset {
             // Initial cases
             None => {
@@ -271,7 +271,7 @@ impl Tokenizer {
         self.state = Some(state);
     }
 
-    fn copy_partial_token_to_scratch_buffer<'st, 'de>(&'st mut self, buffer: &'de [u8]) {
+    fn copy_partial_token_to_scratch_buffer(&mut self, buffer: &[u8]) {
         let partial_token = &buffer[self.start_of_current_token..];
         if !self.using_scratch_buffer_for_current_token {
             self.scratch_buffer_for_current_token.clear();
@@ -355,7 +355,7 @@ impl Tokenizer {
             return;
         }
 
-        let Some(previous_state) = self.state else {
+        if self.state.is_none() {
             self.raw_token_refs
                 .push_back(Err(Error::TriedToProcessMoreDataAfterEof));
             return;
