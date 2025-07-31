@@ -211,7 +211,7 @@ enum TokenizationState {
     BlockCommentInQuotedStringEscape,
 }
 
-pub struct Tokenizer {
+struct TokenizerInner {
     // None when done tokenizing.
     // Someday: indicate EOF vs error states separately?
     state: Option<TokenizationState>,
@@ -225,6 +225,11 @@ pub struct Tokenizer {
     block_comment_depth: i64,
     // Only valid during one iteration
     start_of_current_token: usize,
+}
+
+pub struct Tokenizer<DS> {
+    data_source: DS,
+    inner: TokenizerInner,
 }
 
 #[derive(Debug)]
@@ -245,22 +250,68 @@ macro_rules! whitespace {
     };
 }
 
-impl Tokenizer {
-    pub fn new() -> Tokenizer {
+impl<DS> Tokenizer<DS> {
+    pub fn new(data_source: DS) -> Tokenizer<DS> {
         Tokenizer {
-            state: Some(TokenizationState::Start),
-            scratch_buffer_for_a_previous_token: vec![],
-            scratch_buffer_for_current_token: vec![],
-            using_scratch_buffer_for_current_token: false,
-            raw_token_refs: VecDeque::new(),
-            // byte_offset: 0,
-            // line_num: 1,
-            // col_num: 0,
-            block_comment_depth: 0,
-            start_of_current_token: 0,
+            data_source,
+            inner: TokenizerInner {
+                state: Some(TokenizationState::Start),
+                scratch_buffer_for_a_previous_token: vec![],
+                scratch_buffer_for_current_token: vec![],
+                using_scratch_buffer_for_current_token: false,
+                raw_token_refs: VecDeque::new(),
+                // byte_offset: 0,
+                // line_num: 1,
+                // col_num: 0,
+                block_comment_depth: 0,
+                start_of_current_token: 0,
+            },
         }
     }
+}
 
+impl<'de, DS> Tokenizer<DS>
+where
+    DS: DataSource<'de>,
+{
+    pub fn next_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>, Error> {
+        while self.inner.need_more_data_to_produce_tokens() {
+            match self.data_source.get_more_data() {
+                TokenizerData::Data(buffer) => self.inner.process_more_data(buffer),
+                TokenizerData::Eof => self.inner.eof(),
+            }
+        }
+
+        match self.inner.raw_token_refs.pop_front() {
+            None => Ok(None),
+            Some(Err(error)) => Err(error),
+            Some(Ok(raw_token_ref)) => {
+                let raw_token = match raw_token_ref {
+                    RawTokenRef::LeftParen => RawToken::LeftParen,
+                    RawTokenRef::RightParen => RawToken::RightParen,
+                    RawTokenRef::SexpComment => RawToken::SexpComment,
+                    RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
+                        let raw_token_bytes = match raw_token_ref_data {
+                            RawTokenRefData::Scratch => TokenBytes::Transient(
+                                self.inner.scratch_buffer_for_a_previous_token.as_slice(),
+                            ),
+                            RawTokenRefData::Range(range) => match self.data_source.get_buffer() {
+                                TokenBytes::Borrowed(buf) => TokenBytes::Borrowed(&buf[range]),
+                                TokenBytes::Transient(buf) => TokenBytes::Transient(&buf[range]),
+                            },
+                        };
+
+                        RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
+                    }
+                };
+
+                Ok(Some(raw_token))
+            }
+        }
+    }
+}
+
+impl TokenizerInner {
     fn need_more_data_to_produce_tokens(&self) -> bool {
         self.raw_token_refs.is_empty() && self.state.is_some()
     }
@@ -305,48 +356,6 @@ impl Tokenizer {
             &mut self.scratch_buffer_for_current_token,
         );
         self.scratch_buffer_for_current_token.clear();
-    }
-
-    pub fn next_token<'de, 't, DS>(
-        &'t mut self,
-        data_source: &'t mut DS,
-    ) -> Result<Option<RawToken<'de, 't>>, Error>
-    where
-        DS: DataSource<'de>,
-    {
-        while self.need_more_data_to_produce_tokens() {
-            match data_source.get_more_data() {
-                TokenizerData::Data(buffer) => self.process_more_data(buffer),
-                TokenizerData::Eof => self.eof(),
-            }
-        }
-
-        match self.raw_token_refs.pop_front() {
-            None => Ok(None),
-            Some(Err(error)) => Err(error),
-            Some(Ok(raw_token_ref)) => {
-                let raw_token = match raw_token_ref {
-                    RawTokenRef::LeftParen => RawToken::LeftParen,
-                    RawTokenRef::RightParen => RawToken::RightParen,
-                    RawTokenRef::SexpComment => RawToken::SexpComment,
-                    RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
-                        let raw_token_bytes = match raw_token_ref_data {
-                            RawTokenRefData::Scratch => TokenBytes::Transient(
-                                self.scratch_buffer_for_a_previous_token.as_slice(),
-                            ),
-                            RawTokenRefData::Range(range) => match data_source.get_buffer() {
-                                TokenBytes::Borrowed(buf) => TokenBytes::Borrowed(&buf[range]),
-                                TokenBytes::Transient(buf) => TokenBytes::Transient(&buf[range]),
-                            },
-                        };
-
-                        RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
-                    }
-                };
-
-                Ok(Some(raw_token))
-            }
-        }
     }
 
     pub fn process_more_data(&mut self, buffer: &[u8]) {
@@ -643,14 +652,14 @@ mod tests {
         let mut fragments = buffers.to_vec();
         fragments.reverse();
 
-        let mut data_source = StaticFragments(fragments, None);
-        let mut tokenizer = Tokenizer::new();
+        let data_source = StaticFragments(fragments, None);
+        let mut tokenizer = Tokenizer::new(data_source);
 
         let mut output = String::new();
         let o = &mut output;
 
         loop {
-            let _ = match tokenizer.next_token(&mut data_source) {
+            let _ = match tokenizer.next_token() {
                 Ok(None) => break,
                 Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
                 Err(err) => writeln!(o, "{}", format_error(err)),
@@ -661,14 +670,14 @@ mod tests {
     }
 
     fn tokenize_str(buffer: &[u8]) -> String {
-        let mut data_source = SliceDataSource::new(buffer);
-        let mut tokenizer = Tokenizer::new();
+        let data_source = SliceDataSource::new(buffer);
+        let mut tokenizer = Tokenizer::new(data_source);
 
         let mut output = String::new();
         let o = &mut output;
 
         loop {
-            let _ = match tokenizer.next_token(&mut data_source) {
+            let _ = match tokenizer.next_token() {
                 Ok(None) => break,
                 Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
                 Err(err) => writeln!(o, "{}", format_error(err)),
