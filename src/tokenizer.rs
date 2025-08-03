@@ -3,6 +3,8 @@ use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 
+use crate::input::{Input, InputChunk, InputRef};
+
 // Someday: This should maybe be called `DataToken` (as opposed to `DocToken`, which
 // would include comments?
 #[derive(Debug)]
@@ -18,20 +20,6 @@ pub trait TokenIterator<'de> {
     fn peek(&mut self) -> io::Result<Option<&Token<'de>>>;
 }
 
-enum TokenBytes<'de, 't> {
-    Borrowed(&'de [u8]),
-    Transient(&'t [u8]),
-}
-
-impl<'de, 't> TokenBytes<'de, 't> {
-    fn bytes(&self) -> &[u8] {
-        match self {
-            TokenBytes::Borrowed(buf) => buf,
-            TokenBytes::Transient(buf) => buf,
-        }
-    }
-}
-
 #[derive(Copy, Clone, Debug)]
 pub enum VarTokenKind {
     Atom,
@@ -42,15 +30,15 @@ pub enum VarTokenKind {
 pub enum RawToken<'de, 't> {
     LeftParen,
     RightParen,
-    Atom(TokenBytes<'de, 't>),
-    LineComment(TokenBytes<'de, 't>),
-    BlockComment(TokenBytes<'de, 't>),
+    Atom(InputRef<'de, 't>),
+    LineComment(InputRef<'de, 't>),
+    BlockComment(InputRef<'de, 't>),
     SexpComment,
 }
 
 impl<'de, 't> RawToken<'de, 't> {
     fn from_token_bytes_and_kind(
-        token_bytes: TokenBytes<'de, 't>,
+        token_bytes: InputRef<'de, 't>,
         kind: VarTokenKind,
     ) -> RawToken<'de, 't> {
         match kind {
@@ -58,81 +46,6 @@ impl<'de, 't> RawToken<'de, 't> {
             VarTokenKind::LineComment => RawToken::LineComment(token_bytes),
             VarTokenKind::BlockComment => RawToken::BlockComment(token_bytes),
         }
-    }
-}
-
-enum TokenizerData<'a> {
-    Data(&'a [u8]),
-    Eof,
-}
-
-trait DataSource<'de> {
-    // Someday: This needs to return `io::Result`.
-    fn get_more_data(&mut self) -> TokenizerData<'_>;
-    // Someday: Better word than "buffer"?
-    fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's>;
-}
-
-struct SliceDataSource<'de> {
-    bytes: &'de [u8],
-    curr_offset: Option<usize>,
-    curr_window: &'de [u8],
-    window_size: usize,
-}
-
-const DEFAULT_WINDOW_SIZE: usize = 1024 * 1024; // 1 mb
-
-impl<'de> SliceDataSource<'de> {
-    fn new(bytes: &'de [u8]) -> Self {
-        Self::new_with_window_size(bytes, DEFAULT_WINDOW_SIZE)
-    }
-
-    fn new_with_window_size(bytes: &'de [u8], window_size: usize) -> Self {
-        if window_size == 0 {
-            panic!("window_size passed to SliceDataSource must be non-zero");
-        }
-
-        SliceDataSource {
-            bytes,
-            curr_offset: None,
-            curr_window: &bytes[0..0],
-            window_size,
-        }
-    }
-
-    fn set_current_window(&mut self, starting_at_offset: usize) {
-        self.curr_offset = Some(starting_at_offset);
-        let end = usize::min(starting_at_offset + self.window_size, self.bytes.len());
-        self.curr_window = &self.bytes[starting_at_offset..end];
-    }
-}
-
-impl<'de> DataSource<'de> for SliceDataSource<'de> {
-    fn get_more_data(&mut self) -> TokenizerData<'_> {
-        match self.curr_offset {
-            // Initial cases
-            None => {
-                if self.bytes.len() == 0 {
-                    // Degenerate case; input was empty
-                    TokenizerData::Eof
-                } else {
-                    self.set_current_window(0);
-                    TokenizerData::Data(self.curr_window)
-                }
-            }
-            Some(curr_offset) => {
-                if curr_offset + self.window_size >= self.bytes.len() {
-                    TokenizerData::Eof
-                } else {
-                    self.set_current_window(curr_offset + self.window_size);
-                    TokenizerData::Data(self.curr_window)
-                }
-            }
-        }
-    }
-
-    fn get_buffer<'s>(&'s self) -> TokenBytes<'de, 's> {
-        TokenBytes::Borrowed(self.curr_window)
     }
 }
 
@@ -227,8 +140,8 @@ struct TokenizerInner {
     start_of_current_token: usize,
 }
 
-pub struct Tokenizer<DS> {
-    data_source: DS,
+pub struct Tokenizer<I> {
+    input: I,
     inner: TokenizerInner,
 }
 
@@ -250,10 +163,10 @@ macro_rules! whitespace {
     };
 }
 
-impl<DS> Tokenizer<DS> {
-    pub fn new(data_source: DS) -> Tokenizer<DS> {
+impl<I> Tokenizer<I> {
+    pub fn new(input: I) -> Tokenizer<I> {
         Tokenizer {
-            data_source,
+            input,
             inner: TokenizerInner {
                 state: Some(TokenizationState::Start),
                 scratch_buffer_for_a_previous_token: vec![],
@@ -270,15 +183,15 @@ impl<DS> Tokenizer<DS> {
     }
 }
 
-impl<'de, DS> Tokenizer<DS>
+impl<'de, I> Tokenizer<I>
 where
-    DS: DataSource<'de>,
+    I: Input<'de>,
 {
     pub fn next_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>, Error> {
         while self.inner.need_more_data_to_produce_tokens() {
-            match self.data_source.get_more_data() {
-                TokenizerData::Data(buffer) => self.inner.process_more_data(buffer),
-                TokenizerData::Eof => self.inner.eof(),
+            match self.input.next_chunk() {
+                InputChunk::Data(chunk) => self.inner.process_more_data(chunk),
+                InputChunk::Eof => self.inner.eof(),
             }
         }
 
@@ -292,13 +205,10 @@ where
                     RawTokenRef::SexpComment => RawToken::SexpComment,
                     RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
                         let raw_token_bytes = match raw_token_ref_data {
-                            RawTokenRefData::Scratch => TokenBytes::Transient(
+                            RawTokenRefData::Scratch => InputRef::Transient(
                                 self.inner.scratch_buffer_for_a_previous_token.as_slice(),
                             ),
-                            RawTokenRefData::Range(range) => match self.data_source.get_buffer() {
-                                TokenBytes::Borrowed(buf) => TokenBytes::Borrowed(&buf[range]),
-                                TokenBytes::Transient(buf) => TokenBytes::Transient(&buf[range]),
-                            },
+                            RawTokenRefData::Range(range) => self.input.last_chunk().index(range),
                         };
 
                         RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
@@ -621,39 +531,17 @@ impl TokenizerInner {
 #[cfg(test)]
 mod tests {
     use super::*;
-
-    use std::fmt::Write;
+    use crate::input::tests::ExplicitChunksInput;
+    use crate::input::{InputRef, SliceInput};
 
     use bstr::ByteSlice;
     use insta::assert_snapshot;
 
-    struct StaticFragments(Vec<&'static [u8]>, Option<&'static [u8]>);
-
-    impl<'a> DataSource<'a> for StaticFragments {
-        fn get_more_data(&mut self) -> TokenizerData<'_> {
-            match self.0.pop() {
-                None => {
-                    self.1 = None;
-                    TokenizerData::Eof
-                }
-                Some(buf) => {
-                    self.1 = Some(buf);
-                    TokenizerData::Data(buf)
-                }
-            }
-        }
-
-        fn get_buffer<'s>(&'s self) -> TokenBytes<'a, 's> {
-            TokenBytes::Transient(self.1.unwrap())
-        }
-    }
+    use std::fmt::Write;
 
     fn tokenize_fragments(buffers: &[&'static [u8]]) -> String {
-        let mut fragments = buffers.to_vec();
-        fragments.reverse();
-
-        let data_source = StaticFragments(fragments, None);
-        let mut tokenizer = Tokenizer::new(data_source);
+        let input = ExplicitChunksInput::new(buffers);
+        let mut tokenizer = Tokenizer::new(input);
 
         let mut output = String::new();
         let o = &mut output;
@@ -666,12 +554,12 @@ mod tests {
             };
         }
 
-        return output;
+        output
     }
 
     fn tokenize_str(buffer: &[u8]) -> String {
-        let data_source = SliceDataSource::new(buffer);
-        let mut tokenizer = Tokenizer::new(data_source);
+        let input = SliceInput::new(buffer);
+        let mut tokenizer = Tokenizer::new(input);
 
         let mut output = String::new();
         let o = &mut output;
@@ -684,18 +572,18 @@ mod tests {
             };
         }
 
-        return output;
+        output
     }
 
     fn format_error(err: Error) -> String {
         format!("ERROR: {:?}", err)
     }
 
-    fn format_raw_token<'de, 't>(raw_token: RawToken<'de, 't>) -> String {
-        fn borrowed_or_owned(token_bytes: &TokenBytes<'_, '_>) -> &'static str {
+    fn format_raw_token(raw_token: RawToken<'_, '_>) -> String {
+        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_>) -> &'static str {
             match token_bytes {
-                TokenBytes::Borrowed(_) => "borrowed",
-                TokenBytes::Transient(_) => "transient",
+                InputRef::Borrowed(_) => "borrowed",
+                InputRef::Transient(_) => "transient",
             }
         }
 
@@ -705,17 +593,17 @@ mod tests {
             RawToken::SexpComment => "SexpComment: #;".to_owned(),
             RawToken::Atom(token_bytes) => {
                 let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.bytes().as_bstr();
+                let bytes = token_bytes.as_bstr();
                 format!("Atom: {:?} ({})", bytes, ref_kind)
             }
             RawToken::LineComment(token_bytes) => {
                 let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.bytes().as_bstr();
+                let bytes = token_bytes.as_bstr();
                 format!("LineComment: {:?} ({})", bytes, ref_kind)
             }
             RawToken::BlockComment(token_bytes) => {
                 let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.bytes().as_bstr();
+                let bytes = token_bytes.as_bstr();
                 format!("BlockComment: {:?} ({})", bytes, ref_kind)
             }
         }

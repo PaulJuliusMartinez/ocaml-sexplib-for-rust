@@ -9,6 +9,7 @@
 mod atom;
 pub mod de;
 pub mod error;
+pub mod input;
 pub mod ser;
 pub mod sexp;
 mod token_writer;
