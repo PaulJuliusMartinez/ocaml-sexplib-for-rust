@@ -3,24 +3,34 @@ use std::io;
 
 use serde::{de, ser};
 
+use crate::tokenizer;
+
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Debug)]
 pub enum Error {
     SerializationError(String),
     DeserializationError(String),
-    Io(io::Error),
+    // Someday: Store the location of the tokenization error.
+    TokenizationError(tokenizer::Error),
+    IoError(io::Error),
 }
 
 impl Error {
     pub fn io(io_err: io::Error) -> Error {
-        Error::Io(io_err)
+        Error::IoError(io_err)
     }
 }
 
 impl From<io::Error> for Error {
     fn from(err: io::Error) -> Error {
-        Error::Io(err)
+        Error::IoError(err)
+    }
+}
+
+impl From<tokenizer::Error> for Error {
+    fn from(err: tokenizer::Error) -> Error {
+        Error::TokenizationError(err)
     }
 }
 
@@ -41,7 +51,10 @@ impl Display for Error {
         match self {
             Error::SerializationError(msg) => formatter.write_str(msg),
             Error::DeserializationError(msg) => formatter.write_str(msg),
-            Error::Io(io_err) => write!(formatter, "{}", io_err),
+            Error::TokenizationError(tokenization_err) => {
+                write!(formatter, "{:?}", tokenization_err)
+            }
+            Error::IoError(io_err) => write!(formatter, "{}", io_err),
         }
     }
 }

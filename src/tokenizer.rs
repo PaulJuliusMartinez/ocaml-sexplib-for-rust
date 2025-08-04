@@ -3,6 +3,7 @@ use std::collections::VecDeque;
 use std::io;
 use std::ops::Range;
 
+use crate::error::Result;
 use crate::input::{Input, InputChunk, InputRef};
 
 // Someday: This should maybe be called `DataToken` (as opposed to `DocToken`, which
@@ -131,7 +132,7 @@ struct TokenizerInner {
     scratch_buffer_for_a_previous_token: Vec<u8>,
     scratch_buffer_for_current_token: Vec<u8>,
     using_scratch_buffer_for_current_token: bool,
-    raw_token_refs: VecDeque<Result<RawTokenRef, Error>>,
+    raw_token_refs: VecDeque<Result<RawTokenRef>>,
     // byte_offset: u64,
     // line_num: u64,
     // col_num: u64,
@@ -187,9 +188,9 @@ impl<'de, I> Tokenizer<I>
 where
     I: Input<'de>,
 {
-    pub fn next_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>, Error> {
+    pub fn next_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
         while self.inner.need_more_data_to_produce_tokens() {
-            match self.input.next_chunk() {
+            match self.input.next_chunk()? {
                 InputChunk::Data(chunk) => self.inner.process_more_data(chunk),
                 InputChunk::Eof => self.inner.eof(),
             }
@@ -276,7 +277,7 @@ impl TokenizerInner {
 
         if self.state.is_none() {
             self.raw_token_refs
-                .push_back(Err(Error::TriedToProcessMoreDataAfterEof));
+                .push_back(Err(Error::TriedToProcessMoreDataAfterEof.into()));
             return;
         };
 
@@ -299,7 +300,7 @@ impl TokenizerInner {
                 TokenizationState::CarriageReturn => {
                     if *ch != b'\n' {
                         self.raw_token_refs
-                            .push_back(Err(Error::NakedCarriageReturn));
+                            .push_back(Err(Error::NakedCarriageReturn.into()));
                         // Someday: Make `state` be `Eof`, `Error` or `Some`.
                         self.state = None;
                         return;
@@ -346,13 +347,13 @@ impl TokenizerInner {
                     b'#' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomBar => {
                             self.raw_token_refs
-                                .push_back(Err(Error::BlockCommentEndTokenInUnquotedAtom));
+                                .push_back(Err(Error::BlockCommentEndTokenInUnquotedAtom.into()));
                             self.state = None;
                             return;
                         }
                         TokenizationState::Bar => {
                             self.raw_token_refs
-                                .push_back(Err(Error::UnexpectedEndOfBlockComment));
+                                .push_back(Err(Error::UnexpectedEndOfBlockComment.into()));
                             self.state = None;
                             return;
                         }
@@ -361,7 +362,7 @@ impl TokenizerInner {
                     b'|' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomPoundSign => {
                             self.raw_token_refs
-                                .push_back(Err(Error::BlockCommentStartTokenInUnquotedAtom));
+                                .push_back(Err(Error::BlockCommentStartTokenInUnquotedAtom.into()));
                             self.state = None;
                             return;
                         }
@@ -474,7 +475,7 @@ impl TokenizerInner {
         // Set `self.state` to `None`, indicating that we've seen EOF.
         let Some(final_state) = self.state.take() else {
             self.raw_token_refs
-                .push_back(Err(Error::EofCalledMultipleTimes));
+                .push_back(Err(Error::EofCalledMultipleTimes.into()));
             return;
         };
 
@@ -511,16 +512,16 @@ impl TokenizerInner {
                     VarTokenKind::Atom,
                 ))
             }
-            TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn),
+            TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn.into()),
             TokenizationState::InQuotedAtom | TokenizationState::InQuotedAtomEscape => {
-                Err(Error::UnexpectedEofWhileInInQuotedAtom)
+                Err(Error::UnexpectedEofWhileInInQuotedAtom.into())
             }
             TokenizationState::BlockComment
             | TokenizationState::BlockCommentPoundSign
             | TokenizationState::BlockCommentBar
             | TokenizationState::BlockCommentInQuotedString
             | TokenizationState::BlockCommentInQuotedStringEscape => {
-                Err(Error::UnexpectedEofWhileInBlockComment)
+                Err(Error::UnexpectedEofWhileInBlockComment.into())
             }
         };
 
@@ -531,6 +532,7 @@ impl TokenizerInner {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::error;
     use crate::input::tests::ExplicitChunksInput;
     use crate::input::{InputRef, SliceInput};
 
@@ -575,7 +577,7 @@ mod tests {
         output
     }
 
-    fn format_error(err: Error) -> String {
+    fn format_error(err: error::Error) -> String {
         format!("ERROR: {:?}", err)
     }
 
@@ -725,11 +727,11 @@ mod tests {
 
     #[test]
     fn test_block_comment_errors() {
-        assert_snapshot!(tokenize_str(b"a#|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
-        assert_snapshot!(tokenize_str(b"a##|b"), @"ERROR: BlockCommentStartTokenInUnquotedAtom");
-        assert_snapshot!(tokenize_str(b"a|#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
-        assert_snapshot!(tokenize_str(b"a||#b"), @"ERROR: BlockCommentEndTokenInUnquotedAtom");
-        assert_snapshot!(tokenize_str(b"|#"), @"ERROR: UnexpectedEndOfBlockComment");
+        assert_snapshot!(tokenize_str(b"a#|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
+        assert_snapshot!(tokenize_str(b"a##|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
+        assert_snapshot!(tokenize_str(b"a|#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
+        assert_snapshot!(tokenize_str(b"a||#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
+        assert_snapshot!(tokenize_str(b"|#"), @"ERROR: TokenizationError(UnexpectedEndOfBlockComment)");
     }
 
     #[test]
@@ -782,7 +784,7 @@ mod tests {
     fn test_eof() {
         assert_snapshot!(tokenize_fragments(&[b"a\r"]), @r#"
         Atom: "a" (transient)
-        ERROR: NakedCarriageReturn
+        ERROR: TokenizationError(NakedCarriageReturn)
         "#);
 
         assert_snapshot!(tokenize_fragments(&[b"a"]), @r#"Atom: "a" (transient)"#);
@@ -802,11 +804,11 @@ mod tests {
 
     #[test]
     fn test_eof_errors() {
-        assert_snapshot!(tokenize_fragments(&[b"#|"]), @"ERROR: UnexpectedEofWhileInBlockComment");
-        assert_snapshot!(tokenize_fragments(&[b"#| #"]), @"ERROR: UnexpectedEofWhileInBlockComment");
-        assert_snapshot!(tokenize_fragments(&[b"#| |"]), @"ERROR: UnexpectedEofWhileInBlockComment");
-        assert_snapshot!(tokenize_fragments(&[b"#| \""]), @"ERROR: UnexpectedEofWhileInBlockComment");
-        assert_snapshot!(tokenize_fragments(&[b"#| \"\\"]), @"ERROR: UnexpectedEofWhileInBlockComment");
+        assert_snapshot!(tokenize_fragments(&[b"#|"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(tokenize_fragments(&[b"#| #"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(tokenize_fragments(&[b"#| |"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(tokenize_fragments(&[b"#| \""]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(tokenize_fragments(&[b"#| \"\\"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
     }
 
     #[test]

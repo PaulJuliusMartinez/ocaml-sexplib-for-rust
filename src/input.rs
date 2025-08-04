@@ -1,10 +1,10 @@
+use std::io;
 use std::ops::{Deref, Range};
 
 pub trait Input<'de>: private::Sealed {
     /// Returns the next chunk of input data to be processed by the tokenizer,
     /// or `Eof` to indicate that no more data is available.
-    // Someday: This needs to return `io::Result`.
-    fn next_chunk(&mut self) -> InputChunk<'_>;
+    fn next_chunk(&mut self) -> io::Result<InputChunk<'_>>;
 
     /// Returns a reference to the same data returned by the last call to
     /// `next_chunk`. It is an error for the tokenizer to call this function
@@ -64,11 +64,11 @@ pub struct SliceInput<'de> {
     has_returned_eof: bool,
 }
 
-const DEFAULT_CHUNK_SIZE: usize = 4 * 1024; // 4 kb
+const DEFAULT_SLICE_CHUNK_SIZE: usize = 4 * 1024; // 4 kb
 
 impl<'de> SliceInput<'de> {
     pub fn new(bytes: &'de [u8]) -> Self {
-        Self::new_with_chunk_size(bytes, DEFAULT_CHUNK_SIZE)
+        Self::new_with_chunk_size(bytes, DEFAULT_SLICE_CHUNK_SIZE)
     }
 
     pub fn new_with_chunk_size(bytes: &'de [u8], chunk_size: usize) -> Self {
@@ -96,10 +96,10 @@ impl<'de> SliceInput<'de> {
 impl<'de> private::Sealed for SliceInput<'de> {}
 
 impl<'de> Input<'de> for SliceInput<'de> {
-    fn next_chunk(&mut self) -> InputChunk<'_> {
+    fn next_chunk(&mut self) -> io::Result<InputChunk<'_>> {
         self.next_chunk_has_been_called = true;
 
-        match self.curr_offset {
+        let next_chunk = match self.curr_offset {
             None => {
                 // Getting the first chunk
                 if self.bytes.len() == 0 {
@@ -122,7 +122,9 @@ impl<'de> Input<'de> for SliceInput<'de> {
                     InputChunk::Data(self.curr_chunk)
                 }
             }
-        }
+        };
+
+        Ok(next_chunk)
     }
 
     fn last_chunk<'s>(&'s self) -> InputRef<'de, 's> {
@@ -135,6 +137,87 @@ impl<'de> Input<'de> for SliceInput<'de> {
         }
 
         InputRef::Borrowed(self.curr_chunk)
+    }
+}
+
+/// Input source that rades from a std::io input stream.
+pub struct IoInput<R>
+where
+    R: io::Read,
+{
+    reader: R,
+    buffer: Vec<u8>,
+    curr_used_bytes: usize,
+    next_chunk_has_been_called: bool,
+    has_returned_eof: bool,
+    // Someday: Add support for tailing a file.
+}
+
+const DEFAULT_IO_CHUNK_SIZE: usize = 4 * 1024; // 4 kb
+
+impl<R> IoInput<R>
+where
+    R: io::Read,
+{
+    pub fn new(reader: R) -> Self {
+        Self::new_with_buffer_size(reader, DEFAULT_IO_CHUNK_SIZE)
+    }
+
+    pub fn new_with_buffer_size(reader: R, buffer_size: usize) -> Self {
+        if buffer_size == 0 {
+            panic!("buffer_size passed to IoInput must be non-zero");
+        }
+
+        IoInput {
+            reader,
+            buffer: vec![0; buffer_size],
+            curr_used_bytes: 0,
+            next_chunk_has_been_called: false,
+            has_returned_eof: false,
+        }
+    }
+
+    fn read_chunk(&mut self) -> io::Result<usize> {
+        let bytes_read = self.reader.read(&mut self.buffer)?;
+        self.curr_used_bytes = bytes_read;
+        Ok(bytes_read)
+    }
+
+    fn curr_chunk(&self) -> &[u8] {
+        &self.buffer[0..self.curr_used_bytes]
+    }
+}
+
+impl<R> private::Sealed for IoInput<R> where R: io::Read {}
+
+impl<'de, R> Input<'de> for IoInput<R>
+where
+    R: io::Read,
+{
+    fn next_chunk(&mut self) -> io::Result<InputChunk<'_>> {
+        self.next_chunk_has_been_called = true;
+        let bytes_read = self.read_chunk()?;
+
+        let chunk = if bytes_read == 0 {
+            self.has_returned_eof = true;
+            InputChunk::Eof
+        } else {
+            InputChunk::Data(self.curr_chunk())
+        };
+
+        Ok(chunk)
+    }
+
+    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's> {
+        if !self.next_chunk_has_been_called {
+            panic!("Called `SliceInput::last_chunk` before `next_chunk`.");
+        }
+
+        if self.has_returned_eof {
+            panic!("Called `SliceInput::last_chunk` after `next_chunk` returned `Eof`.");
+        }
+
+        InputRef::Transient(self.curr_chunk())
     }
 }
 
@@ -162,15 +245,15 @@ pub(crate) mod tests {
     }
 
     impl<'a> Input<'a> for ExplicitChunksInput {
-        fn next_chunk(&mut self) -> InputChunk<'_> {
+        fn next_chunk(&mut self) -> io::Result<InputChunk<'_>> {
             match self.remaining_chunks.pop() {
                 None => {
                     self.last_chunk = None;
-                    InputChunk::Eof
+                    Ok(InputChunk::Eof)
                 }
                 Some(chunk) => {
                     self.last_chunk = Some(chunk);
-                    InputChunk::Data(chunk)
+                    Ok(InputChunk::Data(chunk))
                 }
             }
         }
