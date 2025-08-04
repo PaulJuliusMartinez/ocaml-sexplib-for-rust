@@ -10,7 +10,7 @@ pub trait Input<'de>: private::Sealed {
     /// `next_chunk`. It is an error for the tokenizer to call this function
     /// before calling `next_chunk`, or to call it after `next_chunk`
     /// returns `Eof`.
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's>;
+    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]>;
 }
 
 mod private {
@@ -22,20 +22,17 @@ pub enum InputChunk<'t> {
     Eof,
 }
 
-pub enum InputRef<'de, 't> {
-    Borrowed(&'de [u8]),
-    Transient(&'t [u8]),
+#[derive(Debug)]
+pub enum InputRef<'de, 't, T>
+where
+    T: ?Sized,
+{
+    Borrowed(&'de T),
+    Transient(&'t T),
 }
 
-impl<'de, 't> InputRef<'de, 't> {
-    pub fn bytes(&self) -> &[u8] {
-        match self {
-            InputRef::Borrowed(bytes) => bytes,
-            InputRef::Transient(bytes) => bytes,
-        }
-    }
-
-    pub fn index(&self, range: Range<usize>) -> InputRef<'de, 't> {
+impl<'de, 't> InputRef<'de, 't, [u8]> {
+    pub fn index(&self, range: Range<usize>) -> InputRef<'de, 't, [u8]> {
         match self {
             InputRef::Borrowed(bytes) => InputRef::Borrowed(&bytes[range]),
             InputRef::Transient(bytes) => InputRef::Transient(&bytes[range]),
@@ -43,10 +40,13 @@ impl<'de, 't> InputRef<'de, 't> {
     }
 }
 
-impl<'de, 't> Deref for InputRef<'de, 't> {
-    type Target = [u8];
+impl<'de, 't, T> Deref for InputRef<'de, 't, T>
+where
+    T: ?Sized,
+{
+    type Target = T;
 
-    fn deref(&self) -> &[u8] {
+    fn deref(&self) -> &T {
         match *self {
             InputRef::Borrowed(de) => de,
             InputRef::Transient(t) => t,
@@ -127,7 +127,7 @@ impl<'de> Input<'de> for SliceInput<'de> {
         Ok(next_chunk)
     }
 
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's> {
+    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::last_chunk` before `next_chunk`.");
         }
@@ -208,7 +208,7 @@ where
         Ok(chunk)
     }
 
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's> {
+    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::last_chunk` before `next_chunk`.");
         }
@@ -258,7 +258,7 @@ pub(crate) mod tests {
             }
         }
 
-        fn last_chunk<'s>(&'s self) -> InputRef<'a, 's> {
+        fn last_chunk<'s>(&'s self) -> InputRef<'a, 's, [u8]> {
             InputRef::Transient(self.last_chunk.unwrap())
         }
     }

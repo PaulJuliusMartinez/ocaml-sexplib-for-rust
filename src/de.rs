@@ -1,4 +1,3 @@
-use std::borrow::Cow;
 use std::num::{ParseFloatError, ParseIntError};
 
 use serde::de::{
@@ -8,7 +7,8 @@ use serde::de::{
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::tokenizer::{Token, TokenIterator};
+use crate::input::InputRef;
+use crate::tokenizer::{Token, TokenIterator, UnescapedBytes};
 
 #[derive(Debug)]
 pub struct Deserializer<I> {
@@ -39,11 +39,14 @@ where
         Deserializer { tokens }
     }
 
-    fn next(&mut self) -> Result<Option<Token<'de>>> {
+    fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
         Ok(self.tokens.next()?)
     }
 
-    fn peek(&mut self) -> Result<Option<&Token<'de>>> {
+    fn peek<'t>(&'t mut self) -> Result<Option<&'t Token<'de, 't>>>
+    where
+        'de: 't,
+    {
         Ok(self.tokens.peek()?)
     }
 
@@ -51,12 +54,12 @@ where
         let _ = self.tokens.next();
     }
 
-    fn expect_atom(&mut self) -> Result<Cow<'de, [u8]>> {
+    fn expect_atom<'t>(&'t mut self) -> Result<InputRef<'de, 't, UnescapedBytes>> {
         match self.next()? {
             None => error("expected atom; reached end of input"),
             Some(Token::LeftParen) => error("expected atom; got list"),
             Some(Token::RightParen) => error("expected atom; got end of list"),
-            Some(Token::Atom(bytes)) => Ok(bytes),
+            Some(Token::Atom(unescaped_bytes)) => Ok(unescaped_bytes),
         }
     }
 
@@ -147,7 +150,9 @@ where
     where
         V: Visitor<'de>,
     {
-        let b = match self.expect_atom()?.as_ref() {
+        let atom: &[u8] = &self.expect_atom()?;
+
+        let b = match atom {
             b"true" => true,
             b"false" => false,
             _ => return error("expected `true` or `false`"),
@@ -491,24 +496,28 @@ where
 
 #[cfg(test)]
 mod tests {
-    use super::*;
-
     use std::borrow::Cow;
     use std::io;
 
     use insta::assert_debug_snapshot;
 
-    impl<'de> TokenIterator<'de> for Vec<Token<'de>> {
-        fn next(&mut self) -> io::Result<Option<Token<'de>>> {
+    use super::*;
+    use crate::input::InputRef;
+
+    impl<'de> TokenIterator<'de> for Vec<Token<'de, '_>> {
+        fn next<'t>(&'t mut self) -> io::Result<Option<Token<'de, 't>>> {
             Ok(self.pop())
         }
 
-        fn peek(&mut self) -> io::Result<Option<&Token<'de>>> {
+        fn peek<'t>(&'t mut self) -> io::Result<Option<&'t Token<'de, 't>>>
+        where
+            'de: 't,
+        {
             Ok(self.last())
         }
     }
 
-    fn from_tokens<'de, T>(mut tokens: Vec<Token<'de>>) -> Result<T>
+    fn from_tokens<'de, 't, T>(mut tokens: Vec<Token<'de, 't>>) -> Result<T>
     where
         T: Deserialize<'de>,
     {
@@ -517,8 +526,8 @@ mod tests {
         T::deserialize(&mut deserializer)
     }
 
-    fn a(s: &str) -> Token<'_> {
-        Token::Atom(Cow::Borrowed(s.as_bytes()))
+    fn a(s: &'static str) -> Token<'static, '_> {
+        Token::Atom(InputRef::Borrowed(UnescapedBytes::new(s.as_bytes())))
     }
 
     const LP: Token = Token::LeftParen;
@@ -694,7 +703,7 @@ mod tests {
         #[derive(Debug, Deserialize, PartialEq, Eq)]
         struct TupleStruct<'a>(i8, (bool, i8), Cow<'a, str>);
 
-        fn sexp() -> Vec<Token<'static>> {
+        fn sexp<'a>() -> Vec<Token<'static, 'a>> {
             vec![LP, a("1"), LP, a("true"), a("2"), RP, a("abc"), RP]
         }
 

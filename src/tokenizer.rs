@@ -1,24 +1,23 @@
-use std::borrow::Cow;
 use std::collections::VecDeque;
 use std::io;
-use std::ops::Range;
+use std::ops::{Deref, Range};
 
 use crate::error::Result;
 use crate::input::{Input, InputChunk, InputRef};
 
-// Someday: This should maybe be called `DataToken` (as opposed to `DocToken`, which
-// would include comments?
 #[derive(Debug)]
-pub enum Token<'de> {
+pub enum Token<'de, 't> {
     LeftParen,
-    Atom(Cow<'de, [u8]>),
+    Atom(InputRef<'de, 't, UnescapedBytes>),
     RightParen,
 }
 
 pub trait TokenIterator<'de> {
-    fn next(&mut self) -> io::Result<Option<Token<'de>>>;
+    fn next<'t>(&'t mut self) -> io::Result<Option<Token<'de, 't>>>;
 
-    fn peek(&mut self) -> io::Result<Option<&Token<'de>>>;
+    fn peek<'t>(&'t mut self) -> io::Result<Option<&'t Token<'de, 't>>>
+    where
+        'de: 't;
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -28,24 +27,65 @@ pub enum VarTokenKind {
     BlockComment,
 }
 
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct RawBytes([u8]);
+
+impl RawBytes {
+    fn new(bytes: &[u8]) -> &RawBytes {
+        // SAFETY: RawBytes is just a wrapper around [u8], enforced by #[repr(transparent)],
+        // therefore converting &[u8] to &RawBytes is safe.
+        unsafe { &*(bytes as *const [u8] as *const RawBytes) }
+    }
+
+    pub fn bytes(&self) -> &[u8] {
+        &self.0
+    }
+}
+
+#[derive(Debug)]
+#[repr(transparent)]
+pub struct UnescapedBytes(pub [u8]);
+
+impl UnescapedBytes {
+    pub fn new(bytes: &[u8]) -> &UnescapedBytes {
+        // SAFETY: UnescapedBytes is just a wrapper around [u8], enforced by #[repr(transparent)],
+        // therefore converting &[u8] to &UnescapedBytes is safe.
+        unsafe { &*(bytes as *const [u8] as *const UnescapedBytes) }
+    }
+}
+
+impl Deref for UnescapedBytes {
+    type Target = [u8];
+
+    fn deref(&self) -> &Self::Target {
+        &self.0
+    }
+}
+
 pub enum RawToken<'de, 't> {
     LeftParen,
     RightParen,
-    Atom(InputRef<'de, 't>),
-    LineComment(InputRef<'de, 't>),
-    BlockComment(InputRef<'de, 't>),
+    Atom(InputRef<'de, 't, RawBytes>),
+    LineComment(InputRef<'de, 't, RawBytes>),
+    BlockComment(InputRef<'de, 't, RawBytes>),
     SexpComment,
 }
 
 impl<'de, 't> RawToken<'de, 't> {
     fn from_token_bytes_and_kind(
-        token_bytes: InputRef<'de, 't>,
+        token_bytes: InputRef<'de, 't, [u8]>,
         kind: VarTokenKind,
     ) -> RawToken<'de, 't> {
+        let raw_bytes = match token_bytes {
+            InputRef::Borrowed(bytes) => InputRef::Borrowed(RawBytes::new(bytes)),
+            InputRef::Transient(bytes) => InputRef::Transient(RawBytes::new(bytes)),
+        };
+
         match kind {
-            VarTokenKind::Atom => RawToken::Atom(token_bytes),
-            VarTokenKind::LineComment => RawToken::LineComment(token_bytes),
-            VarTokenKind::BlockComment => RawToken::BlockComment(token_bytes),
+            VarTokenKind::Atom => RawToken::Atom(raw_bytes),
+            VarTokenKind::LineComment => RawToken::LineComment(raw_bytes),
+            VarTokenKind::BlockComment => RawToken::BlockComment(raw_bytes),
         }
     }
 }
@@ -582,7 +622,7 @@ mod tests {
     }
 
     fn format_raw_token(raw_token: RawToken<'_, '_>) -> String {
-        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_>) -> &'static str {
+        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_, RawBytes>) -> &'static str {
             match token_bytes {
                 InputRef::Borrowed(_) => "borrowed",
                 InputRef::Transient(_) => "transient",
@@ -593,19 +633,19 @@ mod tests {
             RawToken::LeftParen => "LeftParen: (".to_owned(),
             RawToken::RightParen => "RightParen: )".to_owned(),
             RawToken::SexpComment => "SexpComment: #;".to_owned(),
-            RawToken::Atom(token_bytes) => {
-                let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.as_bstr();
+            RawToken::Atom(raw_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_bytes);
+                let bytes = raw_bytes.bytes().as_bstr();
                 format!("Atom: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::LineComment(token_bytes) => {
-                let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.as_bstr();
+            RawToken::LineComment(raw_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_bytes);
+                let bytes = raw_bytes.bytes().as_bstr();
                 format!("LineComment: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::BlockComment(token_bytes) => {
-                let ref_kind = borrowed_or_owned(&token_bytes);
-                let bytes = token_bytes.as_bstr();
+            RawToken::BlockComment(raw_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_bytes);
+                let bytes = raw_bytes.bytes().as_bstr();
                 format!("BlockComment: {:?} ({})", bytes, ref_kind)
             }
         }
