@@ -27,7 +27,7 @@ pub enum VarTokenKind {
     BlockComment,
 }
 
-enum UnescapeResult<'b, 't> {
+pub enum UnescapeResult<'b, 't> {
     NoUnescapingNeeded(&'b UnescapedBytes),
     Escaped(&'t UnescapedBytes),
 }
@@ -48,13 +48,13 @@ enum UnescapeResult<'b, 't> {
 /// - Literal character escapes \ (backslash), ' (single quote), " (double quote)
 /// - Control character escapes n (newline), t (tab), b (backspace), r (carriage return)
 /// - Decimal escapes: \ddd, where ddd when interpreted in decimal, represents a raw
-/// byte value
+///   byte value
 /// - Hexadecimal escape: \xhh, where hh, when interpreted in hexadecimal, represents a
-/// raw byte value
+///   raw byte value
 /// - Line wrapping escape: \ [newline or CRLF] [spaces or tabs]; these bytes are totally
-/// ignored and used to wrap long atoms on multiple lines
+///   ignored and used to wrap long atoms on multiple lines
 /// - Backslashes followed by any other character is interpreted as a literal backslash
-/// and then that character
+///   and then that character
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct RawBytes([u8]);
@@ -68,6 +68,50 @@ impl RawBytes {
 
     pub fn bytes(&self) -> &[u8] {
         &self.0
+    }
+
+    fn parse_hex_escape(b1: u8, b2: u8) -> std::result::Result<u8, Error> {
+        fn of_hexdigit(b: u8) -> Option<u32> {
+            if b.is_ascii() {
+                (b as char).to_digit(16)
+            } else {
+                None
+            }
+        }
+
+        let h1 = of_hexdigit(b1);
+        let h2 = of_hexdigit(b2);
+
+        let (Some(h1), Some(h2)) = (h1, h2) else {
+            return Err(Error::InvalidHexadecimalEscape);
+        };
+
+        Ok((h1 * 16 + h2) as u8)
+    }
+
+    fn parse_decimal_escape(b1: u8, b2: u8, b3: u8) -> std::result::Result<u8, Error> {
+        fn of_digit(b: u8) -> Option<u32> {
+            if b.is_ascii_digit() {
+                Some((b - b'0') as u32)
+            } else {
+                None
+            }
+        }
+
+        let d1 = of_digit(b1);
+        let d2 = of_digit(b2);
+        let d3 = of_digit(b3);
+
+        let (Some(d1), Some(d2), Some(d3)) = (d1, d2, d3) else {
+            return Err(Error::InvalidDecimalEscape);
+        };
+
+        let b = d1 * 100 + d2 * 10 + d3;
+        if b > 255 {
+            return Err(Error::OutOfRangeDecimalEscape);
+        }
+
+        Ok(b as u8)
     }
 
     /// Unescapes the raw bytes in atoms.
@@ -87,10 +131,14 @@ impl RawBytes {
             )));
         }
 
+        if bytes[bytes.len() - 1] != b'"' {
+            return Err(Error::MismatchedDoubleQuotes);
+        }
+
         // Trim quotes
         let mut bytes = &bytes[1..(bytes.len() - 1)];
 
-        let mut curr_index = 0;
+        // Someday: Use memchr
         let mut next_backslash = bytes.iter().position(|b| *b == b'\\');
         if next_backslash.is_none() {
             return Ok(UnescapeResult::NoUnescapingNeeded(UnescapedBytes::new(
@@ -121,52 +169,18 @@ impl RawBytes {
                         return Err(Error::UnterminatedHexadecimalEscape);
                     }
 
-                    fn of_hexdigit(b: u8) -> Option<u32> {
-                        if b.is_ascii() {
-                            (b as char).to_digit(16)
-                        } else {
-                            None
-                        }
-                    }
-
                     bytes_to_skip = 4;
-                    let h1 = of_hexdigit(bytes[2]);
-                    let h2 = of_hexdigit(bytes[3]);
-
-                    let (Some(h1), Some(h2)) = (h1, h2) else {
-                        return Err(Error::InvalidHexadecimalEscape);
-                    };
-
-                    scratch.push((h1 * 16 + h2) as u8);
+                    let hex_value = Self::parse_hex_escape(bytes[2], bytes[3])?;
+                    scratch.push(hex_value);
                 }
                 _ if escaped_byte.is_ascii_digit() => {
                     if bytes.len() < 4 {
                         return Err(Error::UnterminatedDecimalEscape);
                     }
 
-                    fn of_digit(b: u8) -> Option<u32> {
-                        if b.is_ascii() {
-                            (b as char).to_digit(10)
-                        } else {
-                            None
-                        }
-                    }
-
                     bytes_to_skip = 4;
-                    let d1 = of_digit(bytes[1]);
-                    let d2 = of_digit(bytes[2]);
-                    let d3 = of_digit(bytes[3]);
-
-                    let (Some(d1), Some(d2), Some(d3)) = (d1, d2, d3) else {
-                        return Err(Error::InvalidDecimalEscape);
-                    };
-
-                    let b = d1 * 100 + d2 * 10 + d3;
-                    if b > 255 {
-                        return Err(Error::OutOfRangeDecimalEscape);
-                    }
-
-                    scratch.push(b as u8);
+                    let decimal_value = Self::parse_decimal_escape(bytes[1], bytes[2], bytes[3])?;
+                    scratch.push(decimal_value);
                 }
                 _ => {
                     if escaped_byte == b'\n'
@@ -197,6 +211,76 @@ impl RawBytes {
         Ok(UnescapeResult::Escaped(UnescapedBytes::new(
             scratch.as_slice(),
         )))
+    }
+
+    /// Validate that an atom is valid.
+    pub fn validate_atom(&self) -> std::result::Result<(), Error> {
+        let bytes = &self.0;
+
+        if bytes.len() == 0 {
+            return Err(Error::EmptyRawBytes);
+        }
+
+        if bytes[0] != b'"' {
+            return Ok(());
+        }
+
+        if bytes[bytes.len() - 1] != b'"' {
+            return Err(Error::MismatchedDoubleQuotes);
+        }
+
+        // Trim quotes
+        let mut bytes = &bytes[1..(bytes.len() - 1)];
+
+        while let Some(backslash_index) = bytes.iter().position(|b| *b == b'\\') {
+            bytes = &bytes[backslash_index..];
+
+            let mut bytes_to_skip = 2;
+            if bytes.len() < 2 {
+                return Err(Error::UnterminatedBackslashEscape);
+            }
+
+            let escaped_byte = bytes[1];
+            match bytes[1] {
+                b'\\' | b'\'' | b'"' | b' ' => (), // Literal character escape
+                b'n' | b't' | b'b' | b'r' => (),   // Control character escape
+                b'x' => {
+                    if bytes.len() < 4 {
+                        return Err(Error::UnterminatedHexadecimalEscape);
+                    }
+
+                    bytes_to_skip = 4;
+                    let _ = Self::parse_hex_escape(bytes[2], bytes[3])?;
+                }
+                _ if escaped_byte.is_ascii_digit() => {
+                    if bytes.len() < 4 {
+                        return Err(Error::UnterminatedDecimalEscape);
+                    }
+
+                    bytes_to_skip = 4;
+                    let _ = Self::parse_decimal_escape(bytes[1], bytes[2], bytes[3])?;
+                }
+                _ => {
+                    if escaped_byte == b'\n'
+                        || (escaped_byte == b'\r' && bytes.len() >= 3 && bytes[2] == b'\n')
+                    {
+                        if escaped_byte == b'\r' {
+                            bytes_to_skip += 1;
+                        }
+
+                        while bytes_to_skip < bytes.len()
+                            && (bytes[bytes_to_skip] == b' ' || bytes[bytes_to_skip] == b'\t')
+                        {
+                            bytes_to_skip += 1;
+                        }
+                    }
+                }
+            }
+
+            bytes = &bytes[bytes_to_skip..];
+        }
+
+        Ok(())
     }
 }
 
@@ -343,7 +427,7 @@ pub struct Tokenizer<I> {
     inner: TokenizerInner,
 }
 
-#[derive(Debug)]
+#[derive(Debug, PartialEq, Eq)]
 pub enum Error {
     NakedCarriageReturn,
     BlockCommentStartTokenInUnquotedAtom,
@@ -361,6 +445,7 @@ pub enum Error {
     InvalidHexadecimalEscape,
     InvalidDecimalEscape,
     OutOfRangeDecimalEscape,
+    MismatchedDoubleQuotes,
 }
 
 macro_rules! whitespace {
@@ -1060,41 +1145,90 @@ mod tests {
         );
     }
 
-    #[test]
-    fn test_unescaping_atoms() {
-        fn u(bytes: &[u8]) -> String {
-            let unescaped = RawBytes::new(bytes);
-            let mut scratch = vec![];
+    fn u(bytes: &[u8]) -> String {
+        let unescaped = RawBytes::new(bytes);
+        let mut scratch = vec![];
 
-            match unescaped.unescape_atom(&mut scratch) {
-                Ok(UnescapeResult::NoUnescapingNeeded(bytes)) => {
-                    format!("> {:?} (no unescaping)", bytes.as_bstr())
+        match (
+            unescaped.unescape_atom(&mut scratch),
+            unescaped.validate_atom(),
+        ) {
+            (Ok(UnescapeResult::NoUnescapingNeeded(bytes)), Ok(())) => {
+                format!("> {:?} (no unescaping)", bytes.as_bstr())
+            }
+            (Ok(UnescapeResult::Escaped(bytes)), Ok(())) => {
+                format!("> {:?} (escaped)", bytes.as_bstr())
+            }
+            (Err(unescape_err), Err(validation_err)) => {
+                if unescape_err == validation_err {
+                    format!("> ERROR: {:?}", unescape_err)
+                } else {
+                    panic!(
+                        "RawBytes::unescape_atom and RawBytes::validate_atom returned different errors.\n  unescape error: {:?}\n  validation error: {:?}\n  raw bytes: {:?}",
+                        unescape_err,
+                        validation_err,
+                        bytes.as_bstr(),
+                    );
                 }
-                Ok(UnescapeResult::Escaped(bytes)) => {
-                    format!("> {:?} (escaped)", bytes.as_bstr())
-                }
-                Err(err) => format!("> ERROR: {:?}", err),
+            }
+            (Ok(_), Err(validation_err)) => {
+                panic!(
+                    "RawBytes::unescape_atom returned valid data, but RawBytes::validate_atom returned an error.\n  validation error: {:?}\n  raw bytes: {:?}",
+                    validation_err,
+                    bytes.as_bstr(),
+                );
+            }
+            (Err(unescape_err), Ok(())) => {
+                panic!(
+                    "RawBytes::unescape_atom returned an error, but RawBytes::validate_atom returned Ok.\n  unescape error: {:?}\n  raw bytes: {:?}",
+                    unescape_err,
+                    bytes.as_bstr(),
+                );
             }
         }
+    }
 
-        assert_snapshot!(u(b""),                      @"> ERROR: EmptyRawBytes");
-        assert_snapshot!(u(b"a"),                   @r#"> "a" (no unescaping)"#);
-        assert_snapshot!(u(br#""""#),               @r#"> "" (no unescaping)"#);
-        assert_snapshot!(u(br#""\"""#),             @r#"> "\"" (escaped)"#);
-        assert_snapshot!(u(br#""a\\ \' \" \ z""#),  @r#"> "a\\ \' \"  z" (escaped)"#);
-        assert_snapshot!(u(br#""\n \t \b \r""#),    @r#"> "\n \t \x08 \r" (escaped)"#);
-        assert_snapshot!(u(br#""\000 \255""#),      @r#"> "\0 \xff" (escaped)"#);
-        assert_snapshot!(u(br#""a \256""#),           @"> ERROR: OutOfRangeDecimalEscape");
-        assert_snapshot!(u(br#""a \999""#),           @"> ERROR: OutOfRangeDecimalEscape");
-        assert_snapshot!(u(br#""a \99""#),            @"> ERROR: UnterminatedDecimalEscape");
+    #[test]
+    fn test_unescaping_atoms_basic() {
+        assert_snapshot!(u(b""),                     @"> ERROR: EmptyRawBytes");
+        assert_snapshot!(u(b"a"),                  @r#"> "a" (no unescaping)"#);
+        assert_snapshot!(u(br#""""#),              @r#"> "" (no unescaping)"#);
+        assert_snapshot!(u(br#""abc"#),              @"> ERROR: MismatchedDoubleQuotes");
+        assert_snapshot!(u(br#""\"""#),            @r#"> "\"" (escaped)"#);
+        assert_snapshot!(u(br#""a\\ \' \" \ z""#), @r#"> "a\\ \' \"  z" (escaped)"#);
+        assert_snapshot!(u(br#""\n \t \b \r""#),   @r#"> "\n \t \x08 \r" (escaped)"#);
+        assert_snapshot!(u(b"\"\\\""),              @"> ERROR: UnterminatedBackslashEscape");
+    }
+
+    #[test]
+    fn test_unescaping_atoms_decimal_escapes() {
+        assert_snapshot!(u(br#""\000 \255""#), @r#"> "\0 \xff" (escaped)"#);
+        assert_snapshot!(u(br#""a \256""#),      @"> ERROR: OutOfRangeDecimalEscape");
+        assert_snapshot!(u(br#""a \999""#),      @"> ERROR: OutOfRangeDecimalEscape");
+        assert_snapshot!(u(br#""a \99""#),       @"> ERROR: UnterminatedDecimalEscape");
+    }
+
+    #[test]
+    fn test_unescaping_atoms_hexadecimal_escapes() {
         assert_snapshot!(u(br#""\x00 \xab \xFF""#), @r#"> "\0 \xab \xff" (escaped)"#);
         assert_snapshot!(u(br#""\x0""#),              @"> ERROR: UnterminatedHexadecimalEscape");
         assert_snapshot!(u(br#""\xgg""#),             @"> ERROR: InvalidHexadecimalEscape");
-        assert_snapshot!(u(b"\"abc\\\n   z\""),     @r#"> "abcz" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\\\r\n   z\""),   @r#"> "abcz" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\r   z\""),       @r#"> "abc\r   z" (no unescaping)"#);
-        assert_snapshot!(u(b"\"abc\\\r   z\""),     @r#"> "abc\\\r   z" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\\\rd  z\""),     @r#"> "abc\\\rd  z" (escaped)"#);
-        assert_snapshot!(u(b"\"\\\""),                @"> ERROR: UnterminatedBackslashEscape");
+    }
+
+    #[test]
+    fn test_unescaping_atoms_newline_escapes() {
+        // Spaces after escape newline or CRLF (but not raw `\r`) are removed.
+        assert_snapshot!(u(b"\"abc\\\n   z\""),   @r#"> "abcz" (escaped)"#);
+        assert_snapshot!(u(b"\"abc\\\r\n   z\""), @r#"> "abcz" (escaped)"#);
+        assert_snapshot!(u(b"\"abc\r   z\""),     @r#"> "abc\r   z" (no unescaping)"#);
+        assert_snapshot!(u(b"\"abc\\\r   z\""),   @r#"> "abc\\\r   z" (escaped)"#);
+        assert_snapshot!(u(b"\"abc\\\rd  z\""),   @r#"> "abc\\\rd  z" (escaped)"#);
+        assert_snapshot!(u(b"\"abc\\\r\""),       @r#"> "abc\\\r" (escaped)"#);
+    }
+
+    #[test]
+    fn test_unescape_atom_assumes_validation_from_tokenizer() {
+        // If not quoted, might have spaces
+        assert_snapshot!(u(b" "),                   @r#"> " " (no unescaping)"#);
     }
 }
