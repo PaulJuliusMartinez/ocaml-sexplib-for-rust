@@ -132,7 +132,7 @@ impl RawBytes {
         }
 
         if bytes[bytes.len() - 1] != b'"' {
-            return Err(Error::MismatchedDoubleQuotes);
+            return Err(Error::UnterminatedQuote);
         }
 
         // Trim quotes
@@ -213,25 +213,8 @@ impl RawBytes {
         )))
     }
 
-    /// Validate that an atom is valid.
-    pub fn validate_atom(&self) -> std::result::Result<(), Error> {
-        let bytes = &self.0;
-
-        if bytes.len() == 0 {
-            return Err(Error::EmptyRawBytes);
-        }
-
-        if bytes[0] != b'"' {
-            return Ok(());
-        }
-
-        if bytes[bytes.len() - 1] != b'"' {
-            return Err(Error::MismatchedDoubleQuotes);
-        }
-
-        // Trim quotes
-        let mut bytes = &bytes[1..(bytes.len() - 1)];
-
+    /// Validates that a quoted section contains valid escaping.
+    fn validate_quote_escaping(mut bytes: &[u8]) -> std::result::Result<(), Error> {
         while let Some(backslash_index) = bytes.iter().position(|b| *b == b'\\') {
             bytes = &bytes[backslash_index..];
 
@@ -260,24 +243,71 @@ impl RawBytes {
                     bytes_to_skip = 4;
                     let _ = Self::parse_decimal_escape(bytes[1], bytes[2], bytes[3])?;
                 }
-                _ => {
-                    if escaped_byte == b'\n'
-                        || (escaped_byte == b'\r' && bytes.len() >= 3 && bytes[2] == b'\n')
-                    {
-                        if escaped_byte == b'\r' {
-                            bytes_to_skip += 1;
-                        }
-
-                        while bytes_to_skip < bytes.len()
-                            && (bytes[bytes_to_skip] == b' ' || bytes[bytes_to_skip] == b'\t')
-                        {
-                            bytes_to_skip += 1;
-                        }
-                    }
-                }
+                _ => (), // Newline / CRLF escapes, and non-escapes
             }
 
             bytes = &bytes[bytes_to_skip..];
+        }
+
+        Ok(())
+    }
+
+    /// Validate that an atom is valid.
+    pub fn validate_atom(&self) -> std::result::Result<(), Error> {
+        let bytes = &self.0;
+
+        if bytes.len() == 0 {
+            return Err(Error::EmptyRawBytes);
+        }
+
+        if bytes[0] != b'"' {
+            return Ok(());
+        }
+
+        if bytes[bytes.len() - 1] != b'"' {
+            return Err(Error::UnterminatedQuote);
+        }
+
+        Self::validate_quote_escaping(&bytes[1..(bytes.len() - 1)])
+    }
+
+    pub fn validate_block_comment(&self) -> std::result::Result<(), Error> {
+        let mut bytes = &self.0;
+
+        // Someday: Use memchr
+        while let Some(open_quote_index) = bytes.iter().position(|b| *b == b'"') {
+            bytes = &bytes[(open_quote_index + 1)..];
+
+            let mut close_quote_index = 0;
+            let mut remaining_bytes = bytes;
+
+            'find_close_quote: loop {
+                // Someday: Use memchr2
+                let Some(quote_or_backslash_index) = remaining_bytes
+                    .iter()
+                    .position(|b| *b == b'"' || *b == b'\\')
+                else {
+                    return Err(Error::UnterminatedQuote);
+                };
+
+                close_quote_index += quote_or_backslash_index;
+
+                if remaining_bytes[quote_or_backslash_index] == b'"' {
+                    break 'find_close_quote;
+                }
+
+                if quote_or_backslash_index + 1 >= remaining_bytes.len() {
+                    return Err(Error::UnterminatedBackslashEscape);
+                }
+
+                // Skip past the escaped character (we'll validate the actual escape below).
+                close_quote_index += 2;
+                remaining_bytes = &remaining_bytes[(quote_or_backslash_index + 2)..];
+            }
+
+            Self::validate_quote_escaping(dbg!(&bytes[..close_quote_index]))?;
+
+            bytes = &bytes[(close_quote_index + 1)..];
         }
 
         Ok(())
@@ -445,7 +475,7 @@ pub enum Error {
     InvalidHexadecimalEscape,
     InvalidDecimalEscape,
     OutOfRangeDecimalEscape,
-    MismatchedDoubleQuotes,
+    UnterminatedQuote,
 }
 
 macro_rules! whitespace {
@@ -1193,7 +1223,7 @@ mod tests {
         assert_snapshot!(u(b""),                     @"> ERROR: EmptyRawBytes");
         assert_snapshot!(u(b"a"),                  @r#"> "a" (no unescaping)"#);
         assert_snapshot!(u(br#""""#),              @r#"> "" (no unescaping)"#);
-        assert_snapshot!(u(br#""abc"#),              @"> ERROR: MismatchedDoubleQuotes");
+        assert_snapshot!(u(br#""abc"#),              @"> ERROR: UnterminatedQuote");
         assert_snapshot!(u(br#""\"""#),            @r#"> "\"" (escaped)"#);
         assert_snapshot!(u(br#""a\\ \' \" \ z""#), @r#"> "a\\ \' \"  z" (escaped)"#);
         assert_snapshot!(u(br#""\n \t \b \r""#),   @r#"> "\n \t \x08 \r" (escaped)"#);
@@ -1230,5 +1260,42 @@ mod tests {
     fn test_unescape_atom_assumes_validation_from_tokenizer() {
         // If not quoted, might have spaces
         assert_snapshot!(u(b" "),                   @r#"> " " (no unescaping)"#);
+    }
+
+    #[test]
+    fn test_block_comment_validation() {
+        fn b(bytes: &[u8]) -> String {
+            match RawBytes::new(bytes).validate_block_comment() {
+                Ok(()) => "Ok".to_owned(),
+                Err(err) => format!("{:?}", err),
+            }
+        }
+
+        // Basic
+        assert_snapshot!(b(b"#| |#"),                        @"Ok");
+        assert_snapshot!(b(br#"#| "abc" |#"#),               @"Ok");
+        assert_snapshot!(b(br#"#| "\\ \' \" \ ""abc" |#"#),  @"Ok");
+        assert_snapshot!(b(br#"#| "\n \t \b \r""abc" |#"#),  @"Ok");
+        assert_snapshot!(b(br#"#| "\x00 \xff""abc" |#"#),    @"Ok");
+        assert_snapshot!(b(br#"#| "\x000 \x255""abc" |#"#),  @"Ok");
+
+        // Not in quotes, so fine
+        assert_snapshot!(b(br#"#| \xgg \x0 \256 \999 |#"#),  @"Ok");
+
+        // Invalid escapes
+        assert_snapshot!(b(br#"#| "\xgg" |#"#),     @"InvalidHexadecimalEscape");
+        assert_snapshot!(b(br#"#| "\xf " |#"#),     @"InvalidHexadecimalEscape");
+        assert_snapshot!(b(br#"#| "\xf" |#"#),      @"UnterminatedHexadecimalEscape");
+        assert_snapshot!(b(br#"#| "\256" |#"#),     @"OutOfRangeDecimalEscape");
+        assert_snapshot!(b(br#"#| "\25 " |#"#),     @"InvalidDecimalEscape");
+        assert_snapshot!(b(br#"#| "\25" |#"#),      @"UnterminatedDecimalEscape");
+        assert_snapshot!(b(br#"#| "\"""\xgg" |#"#), @"InvalidHexadecimalEscape");
+        assert_snapshot!(b(br#"#| " \" \""#),       @"UnterminatedQuote");
+
+        // Block comment formatting isn't checked
+        assert_snapshot!(b(br#""#),               @"Ok");
+        assert_snapshot!(b(br#"#| "#),            @"Ok");
+        assert_snapshot!(b(br#" |#"#),            @"Ok");
+        assert_snapshot!(b(br#"#| #| |# |# |#"#), @"Ok");
     }
 }
