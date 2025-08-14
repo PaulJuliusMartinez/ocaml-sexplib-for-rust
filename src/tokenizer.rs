@@ -196,6 +196,9 @@ impl RawBytes {
                             bytes_to_skip += 1;
                         }
                     } else {
+                        // Technically in this case we aren't actually unescaping anything,
+                        // so we could return `NoUnescapingNeeded` if this was the only
+                        // case we hit.
                         scratch.push(b'\\');
                         scratch.push(escaped_byte);
                     }
@@ -334,6 +337,7 @@ impl Deref for UnescapedBytes {
     }
 }
 
+#[derive(Debug)]
 pub enum RawToken<'de, 't> {
     LeftParen,
     RightParen,
@@ -436,7 +440,7 @@ enum TokenizationState {
     BlockCommentInQuotedStringEscape,
 }
 
-struct TokenizerInner {
+struct RawTokenizerInner {
     // None when done tokenizing.
     // Someday: indicate EOF vs error states separately?
     state: Option<TokenizationState>,
@@ -452,9 +456,9 @@ struct TokenizerInner {
     start_of_current_token: usize,
 }
 
-pub struct Tokenizer<I> {
+pub struct RawTokenizer<I> {
     input: I,
-    inner: TokenizerInner,
+    inner: RawTokenizerInner,
 }
 
 #[derive(Debug, PartialEq, Eq)]
@@ -467,6 +471,8 @@ pub enum Error {
     UnexpectedEofWhileInBlockComment,
     TriedToProcessMoreDataAfterEof,
     EofCalledMultipleTimes,
+    UnterminatedSexpCommentAtEof,
+    UnterminatedSexpCommentAtEndOfList,
     // Called when validating and/or unsecaping raw bytes
     EmptyRawBytes,
     UnterminatedBackslashEscape,
@@ -478,17 +484,11 @@ pub enum Error {
     UnterminatedQuote,
 }
 
-macro_rules! whitespace {
-    () => {
-        b' ' | b'\n' | b'\t' | b'\x0c'
-    };
-}
-
-impl<I> Tokenizer<I> {
-    pub fn new(input: I) -> Tokenizer<I> {
-        Tokenizer {
+impl<I> RawTokenizer<I> {
+    pub fn new(input: I) -> RawTokenizer<I> {
+        RawTokenizer {
             input,
-            inner: TokenizerInner {
+            inner: RawTokenizerInner {
                 state: Some(TokenizationState::Start),
                 scratch_buffer_for_a_previous_token: vec![],
                 scratch_buffer_for_current_token: vec![],
@@ -504,11 +504,11 @@ impl<I> Tokenizer<I> {
     }
 }
 
-impl<'de, I> Tokenizer<I>
+impl<'de, I> RawTokenizer<I>
 where
     I: Input<'de>,
 {
-    pub fn next_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
+    pub fn next_raw_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
         while self.inner.need_more_data_to_produce_tokens() {
             match self.input.next_chunk()? {
                 InputChunk::Data(chunk) => self.inner.process_more_data(chunk),
@@ -542,7 +542,13 @@ where
     }
 }
 
-impl TokenizerInner {
+macro_rules! whitespace {
+    () => {
+        b' ' | b'\n' | b'\t' | b'\x0c'
+    };
+}
+
+impl RawTokenizerInner {
     fn need_more_data_to_produce_tokens(&self) -> bool {
         self.raw_token_refs.is_empty() && self.state.is_some()
     }
@@ -849,6 +855,110 @@ impl TokenizerInner {
     }
 }
 
+pub struct Tokenizer<I> {
+    // Someday: Add `validate_atoms_and_block_comments: bool` flag?
+    //
+    sexp_comment_nesting_depths: Vec<usize>,
+    scratch_space_for_unescaped_atom: Vec<u8>,
+    raw_tokenizer: RawTokenizer<I>,
+}
+
+impl<I> Tokenizer<I> {
+    pub fn new(input: I) -> Tokenizer<I> {
+        Tokenizer {
+            sexp_comment_nesting_depths: vec![],
+            scratch_space_for_unescaped_atom: vec![],
+            raw_tokenizer: RawTokenizer::new(input),
+        }
+    }
+}
+
+impl<'de, I> Tokenizer<I>
+where
+    I: Input<'de>,
+{
+    fn consume_commented_out_sexp(&mut self) -> Result<()> {
+        self.sexp_comment_nesting_depths.push(0);
+
+        while !self.sexp_comment_nesting_depths.is_empty() {
+            match self.raw_tokenizer.next_raw_token()? {
+                None => return Err(Error::UnterminatedSexpCommentAtEof.into()),
+                Some(RawToken::LeftParen) => {
+                    *self.sexp_comment_nesting_depths.last_mut().unwrap() += 1
+                }
+                Some(RawToken::RightParen) => {
+                    let last = self.sexp_comment_nesting_depths.last_mut().unwrap();
+                    if *last == 0 {
+                        return Err(Error::UnterminatedSexpCommentAtEndOfList.into());
+                    }
+
+                    *last -= 1;
+                    if *last == 0 {
+                        self.sexp_comment_nesting_depths.pop();
+                    }
+                }
+                Some(RawToken::Atom(atom)) => {
+                    atom.validate_atom()?;
+                    if *self.sexp_comment_nesting_depths.last().unwrap() == 0 {
+                        self.sexp_comment_nesting_depths.pop();
+                    }
+                }
+                Some(RawToken::SexpComment) => {
+                    self.sexp_comment_nesting_depths.push(0);
+                }
+                Some(RawToken::BlockComment(block_comment)) => {
+                    block_comment.validate_block_comment()?;
+                }
+                Some(RawToken::LineComment(_)) => (),
+            }
+        }
+
+        Ok(())
+    }
+}
+
+impl<'de, I> Tokenizer<I>
+where
+    I: Input<'de>,
+{
+    pub fn next_token<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
+        loop {
+            match self.raw_tokenizer.next_raw_token()? {
+                None => return Ok(None),
+                Some(RawToken::LeftParen) => return Ok(Some(Token::LeftParen)),
+                Some(RawToken::RightParen) => return Ok(Some(Token::RightParen)),
+                Some(RawToken::Atom(atom_bytes)) => {
+                    let atom = match atom_bytes {
+                        InputRef::Borrowed(bytes) => {
+                            match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
+                                UnescapeResult::NoUnescapingNeeded(atom) => {
+                                    InputRef::Borrowed(atom)
+                                }
+                                UnescapeResult::Escaped(atom) => InputRef::Transient(atom),
+                            }
+                        }
+                        InputRef::Transient(bytes) => {
+                            match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
+                                UnescapeResult::NoUnescapingNeeded(atom)
+                                | UnescapeResult::Escaped(atom) => InputRef::Transient(atom),
+                            }
+                        }
+                    };
+
+                    return Ok(Some(Token::Atom(atom)));
+                }
+                Some(RawToken::LineComment(_)) => (),
+                Some(RawToken::SexpComment) => {
+                    self.consume_commented_out_sexp()?;
+                }
+                Some(RawToken::BlockComment(comment_bytes)) => {
+                    comment_bytes.validate_block_comment()?;
+                }
+            }
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -861,15 +971,15 @@ mod tests {
 
     use std::fmt::Write;
 
-    fn tokenize_fragments(buffers: &[&'static [u8]]) -> String {
+    fn raw_tokenize_fragments(buffers: &[&'static [u8]]) -> String {
         let input = ExplicitChunksInput::new(buffers);
-        let mut tokenizer = Tokenizer::new(input);
+        let mut raw_tokenizer = RawTokenizer::new(input);
 
         let mut output = String::new();
         let o = &mut output;
 
         loop {
-            let _ = match tokenizer.next_token() {
+            let _ = match raw_tokenizer.next_raw_token() {
                 Ok(None) => break,
                 Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
                 Err(err) => writeln!(o, "{}", format_error(err)),
@@ -879,15 +989,15 @@ mod tests {
         output
     }
 
-    fn tokenize_str(buffer: &[u8]) -> String {
+    fn raw_tokenize_str(buffer: &[u8]) -> String {
         let input = SliceInput::new(buffer);
-        let mut tokenizer = Tokenizer::new(input);
+        let mut raw_tokenizer = RawTokenizer::new(input);
 
         let mut output = String::new();
         let o = &mut output;
 
         loop {
-            let _ = match tokenizer.next_token() {
+            let _ = match raw_tokenizer.next_raw_token() {
                 Ok(None) => break,
                 Ok(Some(raw_token)) => writeln!(o, "{}", format_raw_token(raw_token)),
                 Err(err) => writeln!(o, "{}", format_error(err)),
@@ -933,20 +1043,20 @@ mod tests {
 
     #[test]
     fn test_basics() {
-        assert_snapshot!(tokenize_str(b"a bc 123 "), @r#"
+        assert_snapshot!(raw_tokenize_str(b"a bc 123 "), @r#"
         Atom: "a" (borrowed)
         Atom: "bc" (borrowed)
         Atom: "123" (borrowed)
         "#);
 
-        assert_snapshot!(tokenize_str(b"a\"123\"b \"\""), @r#"
+        assert_snapshot!(raw_tokenize_str(b"a\"123\"b \"\""), @r#"
         Atom: "a" (borrowed)
         Atom: "\"123\"" (borrowed)
         Atom: "b" (borrowed)
         Atom: "\"\"" (borrowed)
         "#);
 
-        assert_snapshot!(tokenize_str(b"## #a #( #) #\"#\" #\r\n#\n| #;|\n# "), @r###"
+        assert_snapshot!(raw_tokenize_str(b"## #a #( #) #\"#\" #\r\n#\n| #;|\n# "), @r###"
         Atom: "##" (borrowed)
         Atom: "#a" (borrowed)
         Atom: "#" (borrowed)
@@ -963,7 +1073,7 @@ mod tests {
         Atom: "#" (borrowed)
         "###);
 
-        assert_snapshot!(tokenize_str(b"z#a z#( z#) z#\"#\" z#\r\nz#\n| z#;|\n"), @r##"
+        assert_snapshot!(raw_tokenize_str(b"z#a z#( z#) z#\"#\" z#\r\nz#\n| z#;|\n"), @r##"
         Atom: "z#a" (borrowed)
         Atom: "z#" (borrowed)
         LeftParen: (
@@ -978,7 +1088,7 @@ mod tests {
         LineComment: ";|" (borrowed)
         "##);
 
-        assert_snapshot!(tokenize_str(b"|| |a |( |) |\"|\" |\r\n|\n# |;|\n| "), @r##"
+        assert_snapshot!(raw_tokenize_str(b"|| |a |( |) |\"|\" |\r\n|\n# |;|\n| "), @r##"
         Atom: "||" (borrowed)
         Atom: "|a" (borrowed)
         Atom: "|" (borrowed)
@@ -995,7 +1105,7 @@ mod tests {
         Atom: "|" (borrowed)
         "##);
 
-        assert_snapshot!(tokenize_str(b"z|a z|( z|) z|\"|\" z|\r\nz|\n# z|;|\n"), @r##"
+        assert_snapshot!(raw_tokenize_str(b"z|a z|( z|) z|\"|\" z|\r\nz|\n# z|;|\n"), @r##"
         Atom: "z|a" (borrowed)
         Atom: "z|" (borrowed)
         LeftParen: (
@@ -1014,14 +1124,14 @@ mod tests {
     #[test]
     fn test_quoted_string_escapes() {
         assert_snapshot!(
-            tokenize_str(b"\"\\\n \\n \\123 \\\\ \\x01 \\x0\""),
+            raw_tokenize_str(b"\"\\\n \\n \\123 \\\\ \\x01 \\x0\""),
             @r#"Atom: "\"\\\n \\n \\123 \\\\ \\x01 \\x0\"" (borrowed)"#);
     }
 
     #[test]
     fn test_line_comments() {
         assert_snapshot!(
-            tokenize_str(b";\"\"\n;abc\r\n;\n "),
+            raw_tokenize_str(b";\"\"\n;abc\r\n;\n "),
             @r#"
         LineComment: ";\"\"" (borrowed)
         LineComment: ";abc" (borrowed)
@@ -1032,7 +1142,7 @@ mod tests {
     #[test]
     fn test_block_comments() {
         assert_snapshot!(
-            tokenize_str(b"#|a|# _ #|# |# _ #|\"|#\\\"\"|# _ #| #| a |#| |#"),
+            raw_tokenize_str(b"#|a|# _ #|# |# _ #|\"|#\\\"\"|# _ #| #| a |#| |#"),
             @r##"
         BlockComment: "#|a|#" (borrowed)
         Atom: "_" (borrowed)
@@ -1047,16 +1157,16 @@ mod tests {
 
     #[test]
     fn test_block_comment_errors() {
-        assert_snapshot!(tokenize_str(b"a#|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
-        assert_snapshot!(tokenize_str(b"a##|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
-        assert_snapshot!(tokenize_str(b"a|#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
-        assert_snapshot!(tokenize_str(b"a||#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
-        assert_snapshot!(tokenize_str(b"|#"), @"ERROR: TokenizationError(UnexpectedEndOfBlockComment)");
+        assert_snapshot!(raw_tokenize_str(b"a#|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
+        assert_snapshot!(raw_tokenize_str(b"a##|b"), @"ERROR: TokenizationError(BlockCommentStartTokenInUnquotedAtom)");
+        assert_snapshot!(raw_tokenize_str(b"a|#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
+        assert_snapshot!(raw_tokenize_str(b"a||#b"), @"ERROR: TokenizationError(BlockCommentEndTokenInUnquotedAtom)");
+        assert_snapshot!(raw_tokenize_str(b"|#"), @"ERROR: TokenizationError(UnexpectedEndOfBlockComment)");
     }
 
     #[test]
     fn test_sexp_comments() {
-        assert_snapshot!(tokenize_str(b"#; a#;x\n##;y\n"), @r###"
+        assert_snapshot!(raw_tokenize_str(b"#; a#;x\n##;y\n"), @r###"
         SexpComment: #;
         Atom: "a#" (borrowed)
         LineComment: ";x" (borrowed)
@@ -1068,17 +1178,17 @@ mod tests {
     #[test]
     fn test_partial_tokens() {
         assert_snapshot!(
-            tokenize_fragments(&[b"abc", b"", b"def", b"ghi "]),
+            raw_tokenize_fragments(&[b"abc", b"", b"def", b"ghi "]),
             @r#"Atom: "abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b";abc", b"def", b"ghi\n"]),
+            raw_tokenize_fragments(&[b";abc", b"def", b"ghi\n"]),
             @r#"LineComment: ";abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"#| abc", b"def", b"ghi |# "]),
+            raw_tokenize_fragments(&[b"#| abc", b"def", b"ghi |# "]),
             @r##"BlockComment: "#| abcdefghi |#" (transient)"##,
         );
     }
@@ -1090,7 +1200,7 @@ mod tests {
         // #a
         // ##
         assert_snapshot!(
-            tokenize_fragments(&[b"#", b"; #", b"| |# #", b"a #", b"# "]),
+            raw_tokenize_fragments(&[b"#", b"; #", b"| |# #", b"a #", b"# "]),
             @r###"
         SexpComment: #;
         BlockComment: "#| |#" (transient)
@@ -1102,39 +1212,39 @@ mod tests {
 
     #[test]
     fn test_eof() {
-        assert_snapshot!(tokenize_fragments(&[b"a\r"]), @r#"
+        assert_snapshot!(raw_tokenize_fragments(&[b"a\r"]), @r#"
         Atom: "a" (transient)
         ERROR: TokenizationError(NakedCarriageReturn)
         "#);
 
-        assert_snapshot!(tokenize_fragments(&[b"a"]), @r#"Atom: "a" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b"a"]), @r#"Atom: "a" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b"a|"]), @r#"Atom: "a|" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b"a|"]), @r#"Atom: "a|" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b"a#"]), @r#"Atom: "a#" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b"a#"]), @r#"Atom: "a#" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b"|"]), @r#"Atom: "|" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b"|"]), @r#"Atom: "|" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
+        assert_snapshot!(raw_tokenize_fragments(&[b";"]), @r#"LineComment: ";" (transient)"#);
 
-        assert_snapshot!(tokenize_fragments(&[b"#"]), @r##"Atom: "#" (transient)"##);
+        assert_snapshot!(raw_tokenize_fragments(&[b"#"]), @r##"Atom: "#" (transient)"##);
     }
 
     #[test]
     fn test_eof_errors() {
-        assert_snapshot!(tokenize_fragments(&[b"#|"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
-        assert_snapshot!(tokenize_fragments(&[b"#| #"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
-        assert_snapshot!(tokenize_fragments(&[b"#| |"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
-        assert_snapshot!(tokenize_fragments(&[b"#| \""]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
-        assert_snapshot!(tokenize_fragments(&[b"#| \"\\"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(raw_tokenize_fragments(&[b"#|"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(raw_tokenize_fragments(&[b"#| #"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(raw_tokenize_fragments(&[b"#| |"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(raw_tokenize_fragments(&[b"#| \""]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
+        assert_snapshot!(raw_tokenize_fragments(&[b"#| \"\\"]), @"ERROR: TokenizationError(UnexpectedEofWhileInBlockComment)");
     }
 
     #[test]
-    fn test_tokenizer() {
+    fn test_raw_tokenizer() {
         assert_snapshot!(
-            tokenize_fragments(&[b"a1 a2", b" a3"]),
+            raw_tokenize_fragments(&[b"a1 a2", b" a3"]),
             @r#"
         Atom: "a1" (transient)
         Atom: "a2" (transient)
@@ -1143,12 +1253,12 @@ mod tests {
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"abc", b"def", b"ghi"]),
+            raw_tokenize_fragments(&[b"abc", b"def", b"ghi"]),
             @r#"Atom: "abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
+            raw_tokenize_fragments(&[b"; lc1\n ; lc2", b"\n ; lc3"]),
             @r#"
         LineComment: "; lc1" (transient)
         LineComment: "; lc2" (transient)
@@ -1157,12 +1267,12 @@ mod tests {
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"; abc", b"def", b"ghi"]),
+            raw_tokenize_fragments(&[b"; abc", b"def", b"ghi"]),
             @r#"LineComment: "; abcdefghi" (transient)"#,
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"#| bc1 |# #| bc2 ", b"|#"]),
+            raw_tokenize_fragments(&[b"#| bc1 |# #| bc2 ", b"|#"]),
             @r##"
         BlockComment: "#| bc1 |#" (transient)
         BlockComment: "#| bc2 |#" (transient)
@@ -1170,7 +1280,7 @@ mod tests {
         );
 
         assert_snapshot!(
-            tokenize_fragments(&[b"#| abc", b"def", b"ghi |#"]),
+            raw_tokenize_fragments(&[b"#| abc", b"def", b"ghi |#"]),
             @r##"BlockComment: "#| abcdefghi |#" (transient)"##,
         );
     }
@@ -1257,9 +1367,15 @@ mod tests {
     }
 
     #[test]
-    fn test_unescape_atom_assumes_validation_from_tokenizer() {
+    fn test_unescape_atom_non_escapes_still_use_scratch_space() {
+        // We could return the original data here, but this case is probably rare.
+        assert_snapshot!(u(b"\"\\a\""), @r#"> "\\a" (escaped)"#);
+    }
+
+    #[test]
+    fn test_unescape_atom_assumes_validation_from_raw_tokenizer() {
         // If not quoted, might have spaces
-        assert_snapshot!(u(b" "),                   @r#"> " " (no unescaping)"#);
+        assert_snapshot!(u(b" "), @r#"> " " (no unescaping)"#);
     }
 
     #[test]
@@ -1297,5 +1413,88 @@ mod tests {
         assert_snapshot!(b(br#"#| "#),            @"Ok");
         assert_snapshot!(b(br#" |#"#),            @"Ok");
         assert_snapshot!(b(br#"#| #| |# |# |#"#), @"Ok");
+    }
+
+    fn format_token(token: Token<'_, '_>) -> String {
+        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_, UnescapedBytes>) -> &'static str {
+            match token_bytes {
+                InputRef::Borrowed(_) => "borrowed",
+                InputRef::Transient(_) => "transient",
+            }
+        }
+
+        match token {
+            Token::LeftParen => "LeftParen: (".to_owned(),
+            Token::RightParen => "RightParen: )".to_owned(),
+            Token::Atom(bytes) => {
+                let ref_kind = borrowed_or_owned(&bytes);
+                format!("Atom: {:?} ({})", bytes.as_bstr(), ref_kind)
+            }
+        }
+    }
+
+    fn tokenize_str(buffer: &[u8]) -> String {
+        let input = SliceInput::new(buffer);
+        let mut tokenizer = Tokenizer::new(input);
+
+        let mut output = String::new();
+        let o = &mut output;
+
+        loop {
+            let _ = match tokenizer.next_token() {
+                Ok(None) => break,
+                Ok(Some(token)) => writeln!(o, "{}", format_token(token)),
+                Err(err) => writeln!(o, "{}", format_error(err)),
+            };
+        }
+
+        output
+    }
+
+    #[test]
+    fn test_tokenizer() {
+        assert_snapshot!(tokenize_str(br#"a "b c" "d\e" f"#), @r#"
+        Atom: "a" (borrowed)
+        Atom: "b c" (borrowed)
+        Atom: "d\\e" (transient)
+        Atom: "f" (transient)
+        "#);
+
+        assert_snapshot!(tokenize_str(b"(a #| xyz |# b c ; abc \n)"), @r#"
+        LeftParen: (
+        Atom: "a" (borrowed)
+        Atom: "b" (borrowed)
+        Atom: "c" (borrowed)
+        RightParen: )
+        "#);
+
+        // Tokenizer does not enforce a valid sexp during regular parsing.
+        assert_snapshot!(tokenize_str(b") ) ( ("), @r"
+        RightParen: )
+        RightParen: )
+        LeftParen: (
+        LeftParen: (
+        ");
+    }
+
+    #[test]
+    fn test_tokenizer_handles_sexp_comments() {
+        assert_snapshot!(tokenize_str(b"a #; b #; (x y z)"), @r#"Atom: "a" (borrowed)"#);
+
+        assert_snapshot!(tokenize_str(b"a #; #; #; w (x #; 0 y) z b c"), @r#"
+        Atom: "a" (borrowed)
+        Atom: "b" (borrowed)
+        Atom: "c" (transient)
+        "#);
+
+        assert_snapshot!(tokenize_str(b"a #;"), @r#"
+        Atom: "a" (borrowed)
+        ERROR: TokenizationError(UnterminatedSexpCommentAtEof)
+        "#);
+
+        assert_snapshot!(tokenize_str(b"(#;)"), @r"
+        LeftParen: (
+        ERROR: TokenizationError(UnterminatedSexpCommentAtEndOfList)
+        ");
     }
 }
