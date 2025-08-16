@@ -12,12 +12,27 @@ pub enum Token<'de, 't> {
     RightParen,
 }
 
+impl<'de, 't> Token<'de, 't> {
+    pub fn kind(&self) -> TokenKind {
+        match self {
+            Token::LeftParen => TokenKind::LeftParen,
+            Token::Atom(_) => TokenKind::Atom,
+            Token::RightParen => TokenKind::RightParen,
+        }
+    }
+}
+
+#[derive(Copy, Clone, Debug)]
+pub enum TokenKind {
+    LeftParen,
+    Atom,
+    RightParen,
+}
+
 pub trait TokenIterator<'de> {
     fn next<'t>(&'t mut self) -> io::Result<Option<Token<'de, 't>>>;
 
-    fn peek<'t>(&'t mut self) -> io::Result<Option<&'t Token<'de, 't>>>
-    where
-        'de: 't;
+    fn peek_kind(&mut self) -> io::Result<Option<TokenKind>>;
 }
 
 #[derive(Copy, Clone, Debug)]

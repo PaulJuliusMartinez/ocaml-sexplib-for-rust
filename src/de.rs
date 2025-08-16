@@ -8,7 +8,7 @@ use serde::Deserialize;
 
 use crate::error::{Error, Result};
 use crate::input::InputRef;
-use crate::tokenizer::{Token, TokenIterator, UnescapedBytes};
+use crate::tokenizer::{Token, TokenIterator, TokenKind, UnescapedBytes};
 
 #[derive(Debug)]
 pub struct Deserializer<I> {
@@ -43,11 +43,8 @@ where
         Ok(self.tokens.next()?)
     }
 
-    fn peek<'t>(&'t mut self) -> Result<Option<&'t Token<'de, 't>>>
-    where
-        'de: 't,
-    {
-        Ok(self.tokens.peek()?)
+    fn peek_kind(&mut self) -> Result<Option<TokenKind>> {
+        Ok(self.tokens.peek_kind()?)
     }
 
     fn advance(&mut self) {
@@ -138,11 +135,11 @@ where
     where
         V: Visitor<'de>,
     {
-        match self.peek()? {
+        match self.peek_kind()? {
             None => error("reached end of input"),
-            Some(Token::RightParen) => error("unexpected end of list"),
-            Some(Token::LeftParen) => self.deserialize_seq(visitor),
-            Some(Token::Atom(_)) => self.deserialize_str(visitor),
+            Some(TokenKind::RightParen) => error("unexpected end of list"),
+            Some(TokenKind::LeftParen) => self.deserialize_seq(visitor),
+            Some(TokenKind::Atom) => self.deserialize_str(visitor),
         }
     }
 
@@ -236,13 +233,13 @@ where
         V: Visitor<'de>,
     {
         self.expect_start_of_list()?;
-        match self.peek()? {
+        match self.peek_kind()? {
             None => error("reached end of input"),
-            Some(Token::RightParen) => {
+            Some(TokenKind::RightParen) => {
                 self.advance();
                 visitor.visit_none()
             }
-            Some(Token::LeftParen | Token::Atom(_)) => {
+            Some(TokenKind::LeftParen | TokenKind::Atom) => {
                 let value = visitor.visit_some(&mut *self)?;
                 self.expect_end_of_list()?;
                 Ok(value)
@@ -345,24 +342,26 @@ where
     where
         V: Visitor<'de>,
     {
-        match self.peek()? {
+        match self.peek_kind()? {
             None => error("reached end of input"),
-            Some(Token::RightParen) => error("expected variant; got end of list"),
-            Some(Token::Atom(atom)) => {
-                match std::str::from_utf8(atom) {
+            Some(TokenKind::RightParen) => error("expected variant; got end of list"),
+            Some(TokenKind::Atom) => {
+                let Some(Token::Atom(atom)) = self.next()? else {
+                    panic!("peek_kind said next would return an atom");
+                };
+                match std::str::from_utf8(&atom) {
                     Ok(s) => {
                         // `IntoDeserializer` is implemented for `&str` and returns a
                         // `StrDeserializer`, which implements a special `EnumAccess`
                         // that only knows how to handle unit variants.
                         let sref: &str = s;
                         let result = visitor.visit_enum(sref.into_deserializer());
-                        self.advance();
                         result
                     }
                     Err(_) => error("atom was not valid UTF-8"),
                 }
             }
-            Some(Token::LeftParen) => {
+            Some(TokenKind::LeftParen) => {
                 self.advance();
                 let result = visitor.visit_enum(&mut *self);
                 if result.is_ok() {
@@ -398,13 +397,13 @@ where
     where
         T: DeserializeSeed<'de>,
     {
-        match self.peek()? {
+        match self.peek_kind()? {
             None => error("reached end of input"),
-            Some(Token::RightParen) => {
+            Some(TokenKind::RightParen) => {
                 self.advance();
                 Ok(None)
             }
-            Some(Token::LeftParen | Token::Atom(_)) => {
+            Some(TokenKind::LeftParen | TokenKind::Atom) => {
                 let value = seed.deserialize(&mut *self)?;
                 Ok(Some(value))
             }
@@ -422,11 +421,11 @@ where
     where
         K: DeserializeSeed<'de>,
     {
-        match self.peek()? {
+        match self.peek_kind()? {
             None => error("reached end of input"),
-            Some(Token::Atom(_)) => error("expect key-value pair, but got atom"),
-            Some(Token::RightParen) => Ok(None),
-            Some(Token::LeftParen) => {
+            Some(TokenKind::Atom) => error("expect key-value pair, but got atom"),
+            Some(TokenKind::RightParen) => Ok(None),
+            Some(TokenKind::LeftParen) => {
                 self.advance();
                 let value = seed.deserialize(&mut *self)?;
                 Ok(Some(value))
@@ -509,11 +508,8 @@ mod tests {
             Ok(self.pop())
         }
 
-        fn peek<'t>(&'t mut self) -> io::Result<Option<&'t Token<'de, 't>>>
-        where
-            'de: 't,
-        {
-            Ok(self.last())
+        fn peek_kind(&mut self) -> io::Result<Option<TokenKind>> {
+            Ok(self.last().map(Token::kind))
         }
     }
 
