@@ -7,8 +7,8 @@ use serde::de::{
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::input::InputRef;
-use crate::tokenizer::{Token, TokenIterator, TokenKind, UnescapedBytes};
+use crate::input::{InputRef, SliceInput};
+use crate::tokenizer::{Token, TokenIterator, TokenKind, Tokenizer, UnescapedBytes};
 
 #[derive(Debug)]
 pub struct Deserializer<I> {
@@ -40,11 +40,11 @@ where
     }
 
     fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
-        Ok(self.tokens.next()?)
+        self.tokens.next()
     }
 
     fn peek_kind(&mut self) -> Result<Option<TokenKind>> {
-        Ok(self.tokens.peek_kind()?)
+        self.tokens.peek_kind()
     }
 
     fn advance(&mut self) {
@@ -78,6 +78,18 @@ where
     }
 }
 
+impl<'de> Deserializer<Tokenizer<SliceInput<'de>>> {
+    pub fn new_from_slice(bytes: &'de [u8]) -> Self {
+        let input = SliceInput::new(bytes);
+        let tokenizer = Tokenizer::new(input);
+        Deserializer::new(tokenizer)
+    }
+
+    pub fn new_from_str(s: &'de str) -> Self {
+        Self::new_from_slice(s.as_bytes())
+    }
+}
+
 fn from_tokens<'de, I, T>(tokens: I) -> Result<T>
 where
     I: TokenIterator<'de>,
@@ -87,6 +99,22 @@ where
     let t = T::deserialize(&mut deserializer)?;
     // Someday: Check `deserializer` for remaining tokens
     Ok(t)
+}
+
+pub fn from_slice<'de, T>(bytes: &'de [u8]) -> Result<T>
+where
+    T: Deserialize<'de>,
+{
+    let input = SliceInput::new(bytes);
+    let tokenizer = Tokenizer::new(input);
+    from_tokens(tokenizer)
+}
+
+pub fn from_str<'de, T>(s: &'de str) -> Result<T>
+where
+    T: Deserialize<'de>,
+{
+    from_slice(s.as_bytes())
 }
 
 macro_rules! impl_deserialize_int {
@@ -496,7 +524,6 @@ where
 #[cfg(test)]
 mod tests {
     use std::borrow::Cow;
-    use std::io;
 
     use insta::assert_debug_snapshot;
 
@@ -504,11 +531,11 @@ mod tests {
     use crate::input::InputRef;
 
     impl<'de> TokenIterator<'de> for Vec<Token<'de, '_>> {
-        fn next<'t>(&'t mut self) -> io::Result<Option<Token<'de, 't>>> {
+        fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
             Ok(self.pop())
         }
 
-        fn peek_kind(&mut self) -> io::Result<Option<TokenKind>> {
+        fn peek_kind(&mut self) -> Result<Option<TokenKind>> {
             Ok(self.last().map(Token::kind))
         }
     }
@@ -933,11 +960,17 @@ mod tests {
 
         // Check Unit
 
-        let unit_sexp = vec![LP, a("start"), a("Unit"), a("end"), RP];
+        let expected = ("start".to_owned(), Variant::Unit, "end".to_owned());
+        let unit_sexp_tokens = vec![LP, a("start"), a("Unit"), a("end"), RP];
+        let unit_sexp_str = "(start Unit end)";
 
         assert_eq!(
-            ("start".to_owned(), Variant::Unit, "end".to_owned()),
-            from_tokens::<(String, Variant, String)>(unit_sexp).unwrap(),
+            expected,
+            from_tokens::<(String, Variant, String)>(unit_sexp_tokens).unwrap()
+        );
+        assert_eq!(
+            expected,
+            from_str::<(String, Variant, String)>(unit_sexp_str).unwrap()
         );
 
         assert_debug_snapshot!(from_tokens::<Variant>(vec![a("Newtype")]), @r#"
@@ -950,11 +983,17 @@ mod tests {
 
         // Check Newtype
 
-        let newtype_sexp = vec![LP, a("start"), LP, a("Newtype"), a("1"), RP, a("end"), RP];
+        let expected = ("start".to_owned(), Variant::Newtype(1), "end".to_owned());
+        let newtype_sexp_tokens = vec![LP, a("start"), LP, a("Newtype"), a("1"), RP, a("end"), RP];
+        let newtype_sexp_str = "(start (Newtype 1) end)";
 
         assert_eq!(
-            ("start".to_owned(), Variant::Newtype(1), "end".to_owned()),
-            from_tokens::<(String, Variant, String)>(newtype_sexp).unwrap(),
+            expected,
+            from_tokens::<(String, Variant, String)>(newtype_sexp_tokens).unwrap(),
+        );
+        assert_eq!(
+            expected,
+            from_str::<(String, Variant, String)>(newtype_sexp_str).unwrap(),
         );
 
         assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Newtype"), RP]), @r#"
@@ -975,6 +1014,7 @@ mod tests {
 
         // Check Tuple
 
+        let expected = ("start".to_owned(), Variant::Tuple(1, 2), "end".to_owned());
         let tuple_tokens = vec![
             LP,
             a("start"),
@@ -986,10 +1026,15 @@ mod tests {
             a("end"),
             RP,
         ];
+        let tuple_str = "(start (Tuple 1 2) end)";
 
         assert_eq!(
-            ("start".to_owned(), Variant::Tuple(1, 2), "end".to_owned()),
+            expected,
             from_tokens::<(String, Variant, String)>(tuple_tokens).unwrap(),
+        );
+        assert_eq!(
+            expected,
+            from_str::<(String, Variant, String)>(tuple_str).unwrap(),
         );
 
         assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Tuple"), a("1"), RP]), @r#"
@@ -1002,7 +1047,12 @@ mod tests {
 
         // Check Struct
 
-        let struct_sexp = vec![
+        let expected = (
+            "start".to_owned(),
+            Variant::Struct { x: 1 },
+            "end".to_owned(),
+        );
+        let struct_tokens = vec![
             LP,
             a("start"),
             LP,
@@ -1015,14 +1065,15 @@ mod tests {
             a("end"),
             RP,
         ];
+        let struct_str = "(start (Struct (x 1)) end)";
 
         assert_eq!(
-            (
-                "start".to_owned(),
-                Variant::Struct { x: 1 },
-                "end".to_owned()
-            ),
-            from_tokens::<(String, Variant, String)>(struct_sexp).unwrap(),
+            expected,
+            from_tokens::<(String, Variant, String)>(struct_tokens).unwrap(),
+        );
+        assert_eq!(
+            expected,
+            from_str::<(String, Variant, String)>(struct_str).unwrap(),
         );
 
         assert_debug_snapshot!(from_tokens::<Variant>(vec![LP, a("Struct"), a("1"), RP]), @r#"

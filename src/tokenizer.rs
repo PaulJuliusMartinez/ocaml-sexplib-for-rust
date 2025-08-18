@@ -1,5 +1,4 @@
 use std::collections::VecDeque;
-use std::io;
 use std::ops::{Deref, Range};
 
 use crate::error::Result;
@@ -30,9 +29,9 @@ pub enum TokenKind {
 }
 
 pub trait TokenIterator<'de> {
-    fn next<'t>(&'t mut self) -> io::Result<Option<Token<'de, 't>>>;
+    fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>>;
 
-    fn peek_kind(&mut self) -> io::Result<Option<TokenKind>>;
+    fn peek_kind(&mut self) -> Result<Option<TokenKind>>;
 }
 
 #[derive(Copy, Clone, Debug)]
@@ -503,7 +502,7 @@ pub struct RawTokenizer<I> {
 
 pub struct RawTokenizerHaveTokensOrSawEofWitness(());
 
-#[derive(Debug, PartialEq, Eq)]
+#[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     NakedCarriageReturn,
     BlockCommentStartTokenInUnquotedAtom,
@@ -561,13 +560,13 @@ where
         Ok(RawTokenizerHaveTokensOrSawEofWitness(()))
     }
 
-    pub fn next_raw_token_without_getting_more_input<'t>(
-        &'t mut self,
-        _witness: RawTokenizerHaveTokensOrSawEofWitness,
+    fn convert_raw_token_ref_to_token<'t, 'a>(
+        &'t self,
+        raw_token_ref: Option<&'a Result<RawTokenRef>>,
     ) -> Result<Option<RawToken<'de, 't>>> {
-        match self.inner.raw_token_refs.pop_front() {
+        match raw_token_ref {
             None => Ok(None),
-            Some(Err(error)) => Err(error),
+            Some(Err(error)) => Err(error.clone()),
             Some(Ok(raw_token_ref)) => {
                 let raw_token = match raw_token_ref {
                     RawTokenRef::LeftParen => RawToken::LeftParen,
@@ -578,10 +577,12 @@ where
                             RawTokenRefData::Scratch => InputRef::Transient(
                                 self.inner.scratch_buffer_for_a_previous_token.as_slice(),
                             ),
-                            RawTokenRefData::Range(range) => self.input.last_chunk().index(range),
+                            RawTokenRefData::Range(range) => {
+                                self.input.last_chunk().index(range.clone())
+                            }
                         };
 
-                        RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
+                        RawToken::from_token_bytes_and_kind(raw_token_bytes, *token_kind)
                     }
                 };
 
@@ -590,13 +591,31 @@ where
         }
     }
 
+    pub fn next_raw_token_without_getting_more_input<'t>(
+        &'t mut self,
+        _witness: RawTokenizerHaveTokensOrSawEofWitness,
+    ) -> Result<Option<RawToken<'de, 't>>> {
+        let next_token = self.inner.raw_token_refs.pop_front();
+        self.convert_raw_token_ref_to_token(next_token.as_ref())
+    }
+
+    pub fn peek_raw_token_without_getting_more_input<'t>(
+        &'t mut self,
+    ) -> Result<Option<RawToken<'de, 't>>> {
+        let next_token = self.inner.raw_token_refs.front();
+        self.convert_raw_token_ref_to_token(next_token)
+    }
+
     // Note that due to the `'t` lifetime, we can't implement the `Iterator` interface.
     pub fn next_raw_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
         let witness = self.process_more_input_if_needed()?;
         self.next_raw_token_without_getting_more_input(witness)
     }
 
-    pub fn advance(&mut self, witness: RawTokenizerHaveTokensOrSawEofWitness) -> Result<()> {
+    pub fn advance_without_getting_more_input(
+        &mut self,
+        witness: RawTokenizerHaveTokensOrSawEofWitness,
+    ) -> Result<()> {
         let _ = self.next_raw_token_without_getting_more_input(witness)?;
         Ok(())
     }
@@ -604,10 +623,10 @@ where
     pub fn peek_raw_token_kind(
         &mut self,
         _witness: &RawTokenizerHaveTokensOrSawEofWitness,
-    ) -> std::result::Result<Option<RawTokenKind>, CallNextRawTokenToGetTheRealError> {
+    ) -> Result<Option<RawTokenKind>> {
         match self.inner.raw_token_refs.front() {
             None => Ok(None),
-            Some(Err(_)) => Err(CallNextRawTokenToGetTheRealError),
+            Some(Err(err)) => Err(err.clone()),
             Some(Ok(raw_token_ref)) => Ok(Some(raw_token_ref.to_raw_token_kind())),
         }
     }
@@ -928,10 +947,10 @@ impl RawTokenizerInner {
 
 pub struct Tokenizer<I> {
     // Someday: Add `validate_atoms_and_block_comments: bool` flag?
-    //
     sexp_comment_nesting_depths: Vec<usize>,
     scratch_space_for_unescaped_atom: Vec<u8>,
     raw_tokenizer: RawTokenizer<I>,
+    peeked_input_error: Option<crate::error::Error>,
 }
 
 impl<I> Tokenizer<I> {
@@ -940,6 +959,7 @@ impl<I> Tokenizer<I> {
             sexp_comment_nesting_depths: vec![],
             scratch_space_for_unescaped_atom: vec![],
             raw_tokenizer: RawTokenizer::new(input),
+            peeked_input_error: None,
         }
     }
 }
@@ -988,50 +1008,71 @@ where
     }
 }
 
-impl<'de, I> Tokenizer<I>
+impl<'de, I> TokenIterator<'de> for Tokenizer<I>
 where
     I: Input<'de>,
 {
-    pub fn next_token<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
+    fn peek_kind(&mut self) -> Result<Option<TokenKind>> {
+        if let Some(error) = &self.peeked_input_error {
+            return Err(error.clone());
+        };
+
+        // We might still have to advance over comment tokens
         loop {
-            // To get around the borrow checker, we have to do this nonsense with peeking,
-            // and then calling `next_raw_token` in separate branches.
-            //
-            // Really we want:
-            // ```
-            // match self.raw_tokenizer.next_raw_token()? {
-            //     Atom(atom) => return atom.unescape()
-            //     _ => ...
-            // }
-            // ```
-            // but then the borrow checker thinks the mutable reference to self has
-            // lifetime 't, and it exists across loop iterations.
-            // (See: https://github.com/rust-lang/rfcs/blob/master/text/2094-nll.md#problem-case-3-conditional-control-flow-across-functions)
-            //
-            // But then this gets worse:
-            // - We want the peek function to return a `&Result`, but this doesn't work,
-            // but we can't propagate the error case, because `error::Error` doesn't
-            // implement `Clone`, because `io::Error` doesn't implement `Clone`. So it will
-            // return a dummy error `CallNextRawTokenToGetTheRealError`, and then you have
-            // to call `next_raw_token` again.
-            // - Imagine `peek_raw_token` has to process more input, and encounters an io
-            // error, so we return `CallNextRawTokenToGetTheRealError`, but the error was
-            // transient, and then `next_raw_token` successfully reads more input and returns
-            // data! So now we have to separate this into two functions, one to (maybe) process
-            // more input, and a second one to get the next input without getting more input,
-            // but the whole point of the `next_raw_token` function is to hide this polling
-            // for more data that happens. So then I also added this stupid witness type to
-            // try to prevent these functions from being misused, but there's really nothing
-            // preventing me from calling `next_raw_token` anyway, so then I want the witness
-            // to be a _linear_ type to force me to use it... ugh.
+            let witness = match self.raw_tokenizer.process_more_input_if_needed() {
+                Ok(witness) => witness,
+                Err(error) => {
+                    self.peeked_input_error = Some(error.clone());
+                    return Err(error);
+                }
+            };
+
+            let Some(raw_token_kind) = self.raw_tokenizer.peek_raw_token_kind(&witness)? else {
+                return Ok(None);
+            };
+
+            match raw_token_kind {
+                RawTokenKind::LeftParen => return Ok(Some(TokenKind::LeftParen)),
+                RawTokenKind::RightParen => return Ok(Some(TokenKind::RightParen)),
+                RawTokenKind::Atom => return Ok(Some(TokenKind::Atom)),
+                RawTokenKind::LineComment => {
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
+                }
+                RawTokenKind::SexpComment => {
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
+                    if let Some(error) = self.consume_commented_out_sexp().err() {
+                        self.peeked_input_error = Some(error.clone());
+                        return Err(error);
+                    };
+                }
+                RawTokenKind::BlockComment => {
+                    let Ok(Some(RawToken::BlockComment(comment_bytes))) = self
+                        .raw_tokenizer
+                        .next_raw_token_without_getting_more_input(witness)
+                    else {
+                        panic!("peek_raw_token_kind just returned BlockComment");
+                    };
+                    comment_bytes.validate_block_comment()?;
+                }
+            }
+        }
+    }
+
+    fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
+        if let Some(error) = self.peeked_input_error.take() {
+            return Err(error);
+        }
+
+        loop {
             let witness = self.raw_tokenizer.process_more_input_if_needed()?;
 
             let raw_token_kind = match self.raw_tokenizer.peek_raw_token_kind(&witness) {
-                Err(CallNextRawTokenToGetTheRealError) => {
-                    return Err(self
-                        .raw_tokenizer
-                        .next_raw_token_without_getting_more_input(witness)
-                        .unwrap_err());
+                Err(err) => {
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
+                    return Err(err.clone());
                 }
                 Ok(None) => return Ok(None),
                 Ok(Some(raw_token_kind)) => raw_token_kind,
@@ -1039,11 +1080,13 @@ where
 
             match raw_token_kind {
                 RawTokenKind::LeftParen => {
-                    self.raw_tokenizer.advance(witness)?;
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
                     return Ok(Some(Token::LeftParen));
                 }
                 RawTokenKind::RightParen => {
-                    self.raw_tokenizer.advance(witness)?;
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
                     return Ok(Some(Token::RightParen));
                 }
                 RawTokenKind::Atom => {
@@ -1074,10 +1117,12 @@ where
                     return Ok(Some(Token::Atom(atom)));
                 }
                 RawTokenKind::LineComment => {
-                    self.raw_tokenizer.advance(witness)?;
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
                 }
                 RawTokenKind::SexpComment => {
-                    self.raw_tokenizer.advance(witness)?;
+                    self.raw_tokenizer
+                        .advance_without_getting_more_input(witness)?;
                     self.consume_commented_out_sexp()?;
                 }
                 RawTokenKind::BlockComment => {
@@ -1576,7 +1621,9 @@ mod tests {
         let o = &mut output;
 
         loop {
-            let _ = match tokenizer.next_token() {
+            // Someday: Do a better job of testing this with and without calling peek?
+            let _ = tokenizer.peek_kind();
+            let _ = match tokenizer.next() {
                 Ok(None) => break,
                 Ok(Some(token)) => writeln!(o, "{}", format_token(token)),
                 Err(err) => writeln!(o, "{}", format_error(err)),
