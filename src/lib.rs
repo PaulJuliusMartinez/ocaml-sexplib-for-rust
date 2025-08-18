@@ -17,6 +17,10 @@ pub mod tokenizer;
 
 pub use sexp::Sexp;
 
+pub use de::{
+    from_slice, from_str, iter_from_slice, iter_from_str, many_from_slice, many_from_str,
+    Deserializer,
+};
 pub use error::{Error, Result};
 pub use ser::{to_string, to_string_mach, to_writer, to_writer_mach, Serializer};
 pub use sexp::de::from_sexp;

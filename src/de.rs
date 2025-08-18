@@ -1,3 +1,4 @@
+use std::marker::PhantomData;
 use std::num::{ParseFloatError, ParseIntError};
 
 use serde::de::{
@@ -115,6 +116,65 @@ where
     T: Deserialize<'de>,
 {
     from_slice(s.as_bytes())
+}
+
+pub fn many_from_slice<'de, T>(bytes: &'de [u8]) -> Result<Vec<T>>
+where
+    T: Deserialize<'de>,
+{
+    let mut ts = vec![];
+    let mut deserializer = Deserializer::new_from_slice(bytes);
+    while deserializer.peek_kind()?.is_some() {
+        let t = T::deserialize(&mut deserializer)?;
+        ts.push(t);
+    }
+    Ok(ts)
+}
+
+pub fn many_from_str<'de, T>(s: &'de str) -> Result<Vec<T>>
+where
+    T: Deserialize<'de>,
+{
+    many_from_slice(s.as_bytes())
+}
+
+struct IterDeserializer<I, T> {
+    deserializer: Deserializer<I>,
+    phantom: std::marker::PhantomData<T>,
+}
+
+pub fn iter_from_slice<'de, T>(bytes: &'de [u8]) -> impl Iterator<Item = Result<T>> + 'de
+where
+    T: Deserialize<'de> + 'de,
+{
+    let deserializer = Deserializer::new_from_slice(bytes);
+    IterDeserializer {
+        deserializer,
+        phantom: PhantomData,
+    }
+}
+
+pub fn iter_from_str<'de, T>(s: &'de str) -> impl Iterator<Item = Result<T>> + 'de
+where
+    T: Deserialize<'de> + 'de,
+{
+    iter_from_slice(s.as_bytes())
+}
+
+impl<'de, I, T> Iterator for IterDeserializer<I, T>
+where
+    I: TokenIterator<'de>,
+    T: Deserialize<'de>,
+{
+    type Item = Result<T>;
+
+    fn next(&mut self) -> Option<Self::Item> {
+        match self.deserializer.peek_kind() {
+            Err(error) => Some(Err(error)),
+            Ok(None) => None,
+            Ok(Some(_)) => Some(T::deserialize(&mut self.deserializer)),
+        }
+    }
 }
 
 macro_rules! impl_deserialize_int {
@@ -948,16 +1008,16 @@ mod tests {
         ");
     }
 
+    #[derive(Debug, Deserialize, PartialEq, Eq)]
+    enum Variant {
+        Unit,
+        Newtype(i32),
+        Tuple(i32, i32),
+        Struct { x: i32 },
+    }
+
     #[test]
     fn test_variant() {
-        #[derive(Debug, Deserialize, PartialEq, Eq)]
-        enum Variant {
-            Unit,
-            Newtype(i32),
-            Tuple(i32, i32),
-            Struct { x: i32 },
-        }
-
         // Check Unit
 
         let expected = ("start".to_owned(), Variant::Unit, "end".to_owned());
@@ -1091,5 +1151,41 @@ mod tests {
             ),
         )
         "#);
+    }
+
+    #[test]
+    fn test_many_from_str() {
+        let sexps_str = r"
+            Unit
+            (Newtype 1)
+            (Tuple 2 3)
+            (Struct (x 4))
+        ";
+
+        let sexps = vec![
+            Variant::Unit,
+            Variant::Newtype(1),
+            Variant::Tuple(2, 3),
+            Variant::Struct { x: 4 },
+        ];
+
+        assert_eq!(sexps, many_from_str::<Variant>(sexps_str).unwrap());
+    }
+
+    #[test]
+    fn test_iter_from_str() {
+        let sexps_str = r"
+            Unit
+            (Newtype 1)
+            (Tuple 2 3)
+            (Struct (x 4))
+        ";
+
+        let mut iter = iter_from_slice::<Variant>(sexps_str.as_bytes());
+        assert_eq!(Variant::Unit, iter.next().unwrap().unwrap());
+        assert_eq!(Variant::Newtype(1), iter.next().unwrap().unwrap());
+        assert_eq!(Variant::Tuple(2, 3), iter.next().unwrap().unwrap());
+        assert_eq!(Variant::Struct { x: 4 }, iter.next().unwrap().unwrap());
+        assert!(iter.next().is_none());
     }
 }
