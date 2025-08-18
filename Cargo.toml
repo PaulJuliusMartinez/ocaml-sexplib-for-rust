@@ -1,6 +1,13 @@
 [package]
 name = "ocaml-sexplib"
-version = "0.1.0"
+version = "0.0.1"
+authors = ["Paul Julius Martinez <pauljuliusmartinez@gmail.com>"]
+description = "An implementation of OCaml's sexplib library"
+keywords = ["ocaml", "sexp", "serde"]
+categories = ["command-line-utilities"]
+repository = "https://github.com/PaulJuliusMartinez/ocaml-sexplib-for-rust"
+readme = "README.md"
+license = "MIT"
 edition = "2021"
 
 [dependencies]
