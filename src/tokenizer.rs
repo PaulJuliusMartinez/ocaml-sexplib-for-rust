@@ -371,8 +371,6 @@ pub enum RawTokenKind {
     SexpComment,
 }
 
-pub struct CallNextRawTokenToGetTheRealError;
-
 impl<'de, 't> RawToken<'de, 't> {
     fn from_token_bytes_and_kind(
         token_bytes: InputRef<'de, 't, [u8]>,
