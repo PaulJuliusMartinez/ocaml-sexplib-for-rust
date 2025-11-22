@@ -416,6 +416,24 @@ impl RawTokenRef {
     }
 }
 
+pub struct HasEnoughData(());
+
+pub trait RawTokenTape {
+    fn feed_more_data(&mut self, data: &[u8]);
+    fn eof(&mut self);
+    fn has_enough_data_to_produce_tokens(&self) -> Option<HasEnoughData>;
+
+    fn next_raw_token<'de, 't>(
+        &'t mut self,
+        witness: HasEnoughData,
+        current_data: Option<InputRef<'de, 't, [u8]>>,
+    ) -> Result<Option<RawToken<'de, 't>>>;
+
+    fn peek_raw_token_kind(&self, witness: &HasEnoughData) -> Result<Option<RawTokenKind>>;
+
+    fn advance(&mut self, witness: HasEnoughData) -> Result<()>;
+}
+
 // Sexplib lexer: https://github.com/janestreet/sexplib/blob/master/src/lexer.mll
 //
 // Rules:
@@ -477,7 +495,7 @@ enum TokenizationState {
     BlockCommentInQuotedStringEscape,
 }
 
-struct RawTokenizerInner {
+pub struct BasicTapeTokenizer {
     // None when done tokenizing.
     // Someday: indicate EOF vs error states separately?
     state: Option<TokenizationState>,
@@ -495,7 +513,7 @@ struct RawTokenizerInner {
 
 pub struct RawTokenizer<I> {
     input: I,
-    inner: RawTokenizerInner,
+    tape_tokenizer: BasicTapeTokenizer,
 }
 
 pub struct RawTokenizerHaveTokensOrSawEofWitness(());
@@ -527,18 +545,7 @@ impl<I> RawTokenizer<I> {
     pub fn new(input: I) -> RawTokenizer<I> {
         RawTokenizer {
             input,
-            inner: RawTokenizerInner {
-                state: Some(TokenizationState::Start),
-                scratch_buffer_for_a_previous_token: vec![],
-                scratch_buffer_for_current_token: vec![],
-                using_scratch_buffer_for_current_token: false,
-                raw_token_refs: VecDeque::new(),
-                // byte_offset: 0,
-                // line_num: 1,
-                // col_num: 0,
-                block_comment_depth: 0,
-                start_of_current_token: 0,
-            },
+            tape_tokenizer: BasicTapeTokenizer::new(),
         }
     }
 }
@@ -547,79 +554,33 @@ impl<'de, I> RawTokenizer<I>
 where
     I: Input<'de>,
 {
-    fn process_more_input_if_needed(&mut self) -> Result<RawTokenizerHaveTokensOrSawEofWitness> {
-        while self.inner.need_more_data_to_produce_tokens() {
+    fn process_more_input_if_needed(&mut self) -> Result<HasEnoughData> {
+        loop {
+            if let Some(witness) = self.tape_tokenizer.has_enough_data_to_produce_tokens() {
+                return Ok(witness);
+            }
+
             match self.input.next_chunk()? {
-                InputChunk::Data(chunk) => self.inner.process_more_data(chunk),
-                InputChunk::Eof => self.inner.eof(),
-            }
-        }
-
-        Ok(RawTokenizerHaveTokensOrSawEofWitness(()))
-    }
-
-    fn convert_raw_token_ref_to_token<'t, 'a>(
-        &'t self,
-        raw_token_ref: Option<&'a Result<RawTokenRef>>,
-    ) -> Result<Option<RawToken<'de, 't>>> {
-        match raw_token_ref {
-            None => Ok(None),
-            Some(Err(error)) => Err(error.clone()),
-            Some(Ok(raw_token_ref)) => {
-                let raw_token = match raw_token_ref {
-                    RawTokenRef::LeftParen => RawToken::LeftParen,
-                    RawTokenRef::RightParen => RawToken::RightParen,
-                    RawTokenRef::SexpComment => RawToken::SexpComment,
-                    RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
-                        let raw_token_bytes = match raw_token_ref_data {
-                            RawTokenRefData::Scratch => InputRef::Transient(
-                                self.inner.scratch_buffer_for_a_previous_token.as_slice(),
-                            ),
-                            RawTokenRefData::Range(range) => {
-                                self.input.current_chunk().index(range.clone())
-                            }
-                        };
-
-                        RawToken::from_token_bytes_and_kind(raw_token_bytes, *token_kind)
-                    }
-                };
-
-                Ok(Some(raw_token))
+                InputChunk::Data(chunk) => self.tape_tokenizer.feed_more_data(chunk),
+                InputChunk::Eof => self.tape_tokenizer.eof(),
             }
         }
     }
 
-    pub fn next_raw_token_without_getting_more_input<'t>(
-        &'t mut self,
-        _witness: RawTokenizerHaveTokensOrSawEofWitness,
-    ) -> Result<Option<RawToken<'de, 't>>> {
-        let next_token = self.inner.raw_token_refs.pop_front();
-        self.convert_raw_token_ref_to_token(next_token.as_ref())
-    }
-
-    // Note that due to the `'t` lifetime, we can't implement the `Iterator` interface.
     pub fn next_raw_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
         let witness = self.process_more_input_if_needed()?;
-        self.next_raw_token_without_getting_more_input(witness)
+        let current_chunk = self.input.current_chunk();
+        self.tape_tokenizer.next_raw_token(witness, current_chunk)
     }
 
-    pub fn advance_without_getting_more_input(
-        &mut self,
-        witness: RawTokenizerHaveTokensOrSawEofWitness,
-    ) -> Result<()> {
-        let _ = self.next_raw_token_without_getting_more_input(witness)?;
-        Ok(())
+    pub fn peek_raw_token_kind(&mut self) -> Result<Option<RawTokenKind>> {
+        let witness = self.process_more_input_if_needed()?;
+        self.tape_tokenizer.peek_raw_token_kind(&witness)
     }
 
-    pub fn peek_raw_token_kind(
-        &mut self,
-        _witness: &RawTokenizerHaveTokensOrSawEofWitness,
-    ) -> Result<Option<RawTokenKind>> {
-        match self.inner.raw_token_refs.front() {
-            None => Ok(None),
-            Some(Err(err)) => Err(err.clone()),
-            Some(Ok(raw_token_ref)) => Ok(Some(raw_token_ref.to_raw_token_kind())),
-        }
+    pub fn advance(&mut self) -> Result<()> {
+        let witness = self.process_more_input_if_needed()?;
+        self.tape_tokenizer.advance(witness)
     }
 }
 
@@ -629,9 +590,20 @@ macro_rules! whitespace {
     };
 }
 
-impl RawTokenizerInner {
-    fn need_more_data_to_produce_tokens(&self) -> bool {
-        self.raw_token_refs.is_empty() && self.state.is_some()
+impl BasicTapeTokenizer {
+    pub fn new() -> Self {
+        BasicTapeTokenizer {
+            state: Some(TokenizationState::Start),
+            scratch_buffer_for_a_previous_token: vec![],
+            scratch_buffer_for_current_token: vec![],
+            using_scratch_buffer_for_current_token: false,
+            raw_token_refs: VecDeque::new(),
+            // byte_offset: 0,
+            // line_num: 1,
+            // col_num: 0,
+            block_comment_depth: 0,
+            start_of_current_token: 0,
+        }
     }
 
     fn start_new_token(&mut self, pos: usize, state: TokenizationState) {
@@ -675,8 +647,67 @@ impl RawTokenizerInner {
         );
         self.scratch_buffer_for_current_token.clear();
     }
+}
 
-    pub fn process_more_data(&mut self, buffer: &[u8]) {
+impl RawTokenTape for BasicTapeTokenizer {
+    fn has_enough_data_to_produce_tokens(&self) -> Option<HasEnoughData> {
+        if self.raw_token_refs.is_empty() && self.state.is_some() {
+            None
+        } else {
+            Some(HasEnoughData(()))
+        }
+    }
+
+    fn peek_raw_token_kind(&self, _: &HasEnoughData) -> Result<Option<RawTokenKind>> {
+        match self.raw_token_refs.front() {
+            None => Ok(None),
+            Some(Err(err)) => Err(err.clone()),
+            Some(Ok(raw_token_ref)) => Ok(Some(raw_token_ref.to_raw_token_kind())),
+        }
+    }
+
+    fn next_raw_token<'de, 't>(
+        &'t mut self,
+        _: HasEnoughData,
+        current_data: Option<InputRef<'de, 't, [u8]>>,
+    ) -> Result<Option<RawToken<'de, 't>>> {
+        match self.raw_token_refs.pop_front() {
+            None => Ok(None),
+            Some(Err(error)) => Err(error),
+            Some(Ok(raw_token_ref)) => {
+                let raw_token = match raw_token_ref {
+                    RawTokenRef::LeftParen => RawToken::LeftParen,
+                    RawTokenRef::RightParen => RawToken::RightParen,
+                    RawTokenRef::SexpComment => RawToken::SexpComment,
+                    RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
+                        let raw_token_bytes = match raw_token_ref_data {
+                            RawTokenRefData::Scratch => InputRef::Transient(
+                                self.scratch_buffer_for_a_previous_token.as_slice(),
+                            ),
+                            RawTokenRefData::Range(range) => match current_data {
+                                Some(data) => data.index(range.clone()),
+                                None => panic!("TapeTokenizer has stale `Range` ref."),
+                            },
+                        };
+
+                        RawToken::from_token_bytes_and_kind(raw_token_bytes, token_kind)
+                    }
+                };
+
+                Ok(Some(raw_token))
+            }
+        }
+    }
+
+    fn advance(&mut self, _: HasEnoughData) -> Result<()> {
+        match self.raw_token_refs.pop_front() {
+            None => Ok(()),
+            Some(Err(error)) => Err(error),
+            Some(Ok(_raw_token_ref)) => Ok(()),
+        }
+    }
+
+    fn feed_more_data(&mut self, buffer: &[u8]) {
         assert!(self.raw_token_refs.is_empty());
 
         // Immediately return if no data to process
@@ -880,7 +911,7 @@ impl RawTokenizerInner {
         }
     }
 
-    pub fn eof(&mut self) {
+    fn eof(&mut self) {
         // Set `self.state` to `None`, indicating that we've seen EOF.
         let Some(final_state) = self.state.take() else {
             self.raw_token_refs
@@ -1010,17 +1041,9 @@ where
             return Err(error.clone());
         };
 
-        // We might still have to advance over comment tokens
+        // We might have to advance over comment tokens
         loop {
-            let witness = match self.raw_tokenizer.process_more_input_if_needed() {
-                Ok(witness) => witness,
-                Err(error) => {
-                    self.peeked_input_error = Some(error.clone());
-                    return Err(error);
-                }
-            };
-
-            let Some(raw_token_kind) = self.raw_tokenizer.peek_raw_token_kind(&witness)? else {
+            let Some(raw_token_kind) = self.raw_tokenizer.peek_raw_token_kind()? else {
                 return Ok(None);
             };
 
@@ -1028,22 +1051,17 @@ where
                 RawTokenKind::LeftParen => return Ok(Some(TokenKind::LeftParen)),
                 RawTokenKind::RightParen => return Ok(Some(TokenKind::RightParen)),
                 RawTokenKind::Atom => return Ok(Some(TokenKind::Atom)),
-                RawTokenKind::LineComment => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
-                }
+                RawTokenKind::LineComment => self.raw_tokenizer.advance()?,
                 RawTokenKind::SexpComment => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
+                    self.raw_tokenizer.advance()?;
                     if let Some(error) = self.consume_commented_out_sexp().err() {
                         self.peeked_input_error = Some(error.clone());
                         return Err(error);
                     };
                 }
                 RawTokenKind::BlockComment => {
-                    let Ok(Some(RawToken::BlockComment(comment_bytes))) = self
-                        .raw_tokenizer
-                        .next_raw_token_without_getting_more_input(witness)
+                    let Ok(Some(RawToken::BlockComment(comment_bytes))) =
+                        self.raw_tokenizer.next_raw_token()
                     else {
                         panic!("peek_raw_token_kind just returned BlockComment");
                     };
@@ -1059,33 +1077,50 @@ where
         }
 
         loop {
-            let witness = self.raw_tokenizer.process_more_input_if_needed()?;
-
-            let raw_token_kind = match self.raw_tokenizer.peek_raw_token_kind(&witness) {
-                Err(err) => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
-                    return Err(err.clone());
-                }
+            // The obvious way to write the body of this loop is: ```
+            //     match self.raw_tokenizer.next_raw_token()? {
+            //         None => return Ok(None),
+            //         Some(RawToken::LeftParen) => return Ok(Some(Token::LeftParen)),
+            //         Some(RawToken::RightParen) => return Ok(Some(Token::RightParen)),
+            //         Some(RawToken::Atom(_)) => return Ok(Some(Token::Atom(atom))),
+            //         Some(RawToken::LineComment(_)) => (),
+            //         Some(RawToken::SexpComment) => self.consume_commented_out_sexp()?,
+            //         Some(RawToken::BlockComment(_)) => ...,
+            //     }
+            // ```
+            //
+            // But because we return the `atom` (which has a lifetime tied to `next_raw_token`),
+            // the borrow checker thinks the borrow when we're calling `next_raw_token` has
+            // lifetime 't, and so we can't call `consume_commented_out_sexp`, or proceed
+            // to the next iteration of the loop.
+            //
+            // Instead, we have to call `peek_raw_token_kind`, have that be a temporary reference,
+            // then only call `next_raw_token` in the branches where we return.
+            //
+            // This is the "Problem Case #3" mentioned here:
+            // https://blog.rust-lang.org/inside-rust/2023/10/06/polonius-update/
+            let raw_token_kind = match self.raw_tokenizer.peek_raw_token_kind() {
                 Ok(None) => return Ok(None),
                 Ok(Some(raw_token_kind)) => raw_token_kind,
+                Err(err) => {
+                    self.raw_tokenizer.advance()?;
+                    // `advance` should return the peeked error, so I don't think
+                    // we'll ever actually get here.
+                    return Err(err.clone());
+                }
             };
 
             match raw_token_kind {
                 RawTokenKind::LeftParen => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
+                    self.raw_tokenizer.advance()?;
                     return Ok(Some(Token::LeftParen));
                 }
                 RawTokenKind::RightParen => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
+                    self.raw_tokenizer.advance()?;
                     return Ok(Some(Token::RightParen));
                 }
                 RawTokenKind::Atom => {
-                    let Ok(Some(RawToken::Atom(atom_bytes))) = self
-                        .raw_tokenizer
-                        .next_raw_token_without_getting_more_input(witness)
+                    let Ok(Some(RawToken::Atom(atom_bytes))) = self.raw_tokenizer.next_raw_token()
                     else {
                         panic!("peek_raw_token_kind just returned Atom");
                     };
@@ -1109,22 +1144,18 @@ where
 
                     return Ok(Some(Token::Atom(atom)));
                 }
-                RawTokenKind::LineComment => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
-                }
+                RawTokenKind::LineComment => self.raw_tokenizer.advance()?,
                 RawTokenKind::SexpComment => {
-                    self.raw_tokenizer
-                        .advance_without_getting_more_input(witness)?;
+                    self.raw_tokenizer.advance()?;
                     self.consume_commented_out_sexp()?;
                 }
                 RawTokenKind::BlockComment => {
-                    let Ok(Some(RawToken::BlockComment(comment_bytes))) = self
-                        .raw_tokenizer
-                        .next_raw_token_without_getting_more_input(witness)
+                    let Ok(Some(RawToken::BlockComment(comment_bytes))) =
+                        self.raw_tokenizer.next_raw_token()
                     else {
                         panic!("peek_raw_token_kind just returned BlockComment");
                     };
+
                     comment_bytes.validate_block_comment()?;
                 }
             }

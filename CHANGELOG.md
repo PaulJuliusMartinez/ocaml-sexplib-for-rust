@@ -1,5 +1,6 @@
 main
 ====
+- Rework low-level API to expose `RawTokenTape` trait
 - Remove unused `CallNextRawTokenToGetTheRealError`
 
 

@@ -7,10 +7,9 @@ pub trait Input<'de>: private::Sealed {
     fn next_chunk(&mut self) -> io::Result<InputChunk<'_>>;
 
     /// Returns a reference to the same data returned by the last call to
-    /// `next_chunk`. It is an error for the tokenizer to call this function
-    /// before calling `next_chunk`, or to call it after `next_chunk`
-    /// returns `Eof`.
-    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]>;
+    /// `next_chunk` if `next_chunk` returned `Data`. Returns `None` if
+    /// `next_chunk` return `Eof`.
+    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>>;
 }
 
 mod private {
@@ -127,16 +126,16 @@ impl<'de> Input<'de> for SliceInput<'de> {
         Ok(next_chunk)
     }
 
-    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
+    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
 
         if self.has_returned_eof {
-            panic!("Called `SliceInput::current_chunk` after `next_chunk` returned `Eof`.");
+            None
+        } else {
+            Some(InputRef::Borrowed(self.curr_chunk))
         }
-
-        InputRef::Borrowed(self.curr_chunk)
     }
 }
 
@@ -208,16 +207,16 @@ where
         Ok(chunk)
     }
 
-    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
+    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
 
         if self.has_returned_eof {
-            panic!("Called `SliceInput::current_chunk` after `next_chunk` returned `Eof`.");
+            None
+        } else {
+            Some(InputRef::Transient(self.curr_chunk()))
         }
-
-        InputRef::Transient(self.curr_chunk())
     }
 }
 
@@ -258,8 +257,11 @@ pub(crate) mod tests {
             }
         }
 
-        fn current_chunk<'s>(&'s self) -> InputRef<'a, 's, [u8]> {
-            InputRef::Transient(self.current_chunk.unwrap())
+        fn current_chunk<'s>(&'s self) -> Option<InputRef<'a, 's, [u8]>> {
+            match self.current_chunk {
+                None => None,
+                Some(chunk) => Some(InputRef::Transient(chunk)),
+            }
         }
     }
 }
