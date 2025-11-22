@@ -511,13 +511,6 @@ pub struct BasicTapeTokenizer {
     start_of_current_token: usize,
 }
 
-pub struct RawTokenizer<I> {
-    input: I,
-    tape_tokenizer: BasicTapeTokenizer,
-}
-
-pub struct RawTokenizerHaveTokensOrSawEofWitness(());
-
 #[derive(Clone, Debug, PartialEq, Eq)]
 pub enum Error {
     NakedCarriageReturn,
@@ -539,49 +532,6 @@ pub enum Error {
     InvalidDecimalEscape,
     OutOfRangeDecimalEscape,
     UnterminatedQuote,
-}
-
-impl<I> RawTokenizer<I> {
-    pub fn new(input: I) -> RawTokenizer<I> {
-        RawTokenizer {
-            input,
-            tape_tokenizer: BasicTapeTokenizer::new(),
-        }
-    }
-}
-
-impl<'de, I> RawTokenizer<I>
-where
-    I: Input<'de>,
-{
-    fn process_more_input_if_needed(&mut self) -> Result<HasEnoughData> {
-        loop {
-            if let Some(witness) = self.tape_tokenizer.has_enough_data_to_produce_tokens() {
-                return Ok(witness);
-            }
-
-            match self.input.next_chunk()? {
-                InputChunk::Data(chunk) => self.tape_tokenizer.feed_more_data(chunk),
-                InputChunk::Eof => self.tape_tokenizer.eof(),
-            }
-        }
-    }
-
-    pub fn next_raw_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
-        let witness = self.process_more_input_if_needed()?;
-        let current_chunk = self.input.current_chunk();
-        self.tape_tokenizer.next_raw_token(witness, current_chunk)
-    }
-
-    pub fn peek_raw_token_kind(&mut self) -> Result<Option<RawTokenKind>> {
-        let witness = self.process_more_input_if_needed()?;
-        self.tape_tokenizer.peek_raw_token_kind(&witness)
-    }
-
-    pub fn advance(&mut self) -> Result<()> {
-        let witness = self.process_more_input_if_needed()?;
-        self.tape_tokenizer.advance(witness)
-    }
 }
 
 macro_rules! whitespace {
@@ -966,6 +916,54 @@ impl RawTokenTape for BasicTapeTokenizer {
         };
 
         self.raw_token_refs.push_back(final_token_ref);
+    }
+}
+
+pub struct RawTokenizer<I> {
+    input: I,
+    tape_tokenizer: BasicTapeTokenizer,
+}
+
+impl<I> RawTokenizer<I> {
+    pub fn new(input: I) -> RawTokenizer<I> {
+        RawTokenizer {
+            input,
+            tape_tokenizer: BasicTapeTokenizer::new(),
+        }
+    }
+}
+
+impl<'de, I> RawTokenizer<I>
+where
+    I: Input<'de>,
+{
+    fn process_more_input_if_needed(&mut self) -> Result<HasEnoughData> {
+        loop {
+            if let Some(witness) = self.tape_tokenizer.has_enough_data_to_produce_tokens() {
+                return Ok(witness);
+            }
+
+            match self.input.next_chunk()? {
+                InputChunk::Data(chunk) => self.tape_tokenizer.feed_more_data(chunk),
+                InputChunk::Eof => self.tape_tokenizer.eof(),
+            }
+        }
+    }
+
+    pub fn next_raw_token<'t>(&'t mut self) -> Result<Option<RawToken<'de, 't>>> {
+        let witness = self.process_more_input_if_needed()?;
+        let current_chunk = self.input.current_chunk();
+        self.tape_tokenizer.next_raw_token(witness, current_chunk)
+    }
+
+    pub fn peek_raw_token_kind(&mut self) -> Result<Option<RawTokenKind>> {
+        let witness = self.process_more_input_if_needed()?;
+        self.tape_tokenizer.peek_raw_token_kind(&witness)
+    }
+
+    pub fn advance(&mut self) -> Result<()> {
+        let witness = self.process_more_input_if_needed()?;
+        self.tape_tokenizer.advance(witness)
     }
 }
 
