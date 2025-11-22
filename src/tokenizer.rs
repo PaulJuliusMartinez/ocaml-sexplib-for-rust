@@ -576,7 +576,7 @@ where
                                 self.inner.scratch_buffer_for_a_previous_token.as_slice(),
                             ),
                             RawTokenRefData::Range(range) => {
-                                self.input.last_chunk().index(range.clone())
+                                self.input.current_chunk().index(range.clone())
                             }
                         };
 
@@ -595,13 +595,6 @@ where
     ) -> Result<Option<RawToken<'de, 't>>> {
         let next_token = self.inner.raw_token_refs.pop_front();
         self.convert_raw_token_ref_to_token(next_token.as_ref())
-    }
-
-    pub fn peek_raw_token_without_getting_more_input<'t>(
-        &'t mut self,
-    ) -> Result<Option<RawToken<'de, 't>>> {
-        let next_token = self.inner.raw_token_refs.front();
-        self.convert_raw_token_ref_to_token(next_token)
     }
 
     // Note that due to the `'t` lifetime, we can't implement the `Iterator` interface.
@@ -684,6 +677,8 @@ impl RawTokenizerInner {
     }
 
     pub fn process_more_data(&mut self, buffer: &[u8]) {
+        assert!(self.raw_token_refs.is_empty());
+
         // Immediately return if no data to process
         if buffer.is_empty() {
             return;

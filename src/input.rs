@@ -10,7 +10,7 @@ pub trait Input<'de>: private::Sealed {
     /// `next_chunk`. It is an error for the tokenizer to call this function
     /// before calling `next_chunk`, or to call it after `next_chunk`
     /// returns `Eof`.
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]>;
+    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]>;
 }
 
 mod private {
@@ -127,13 +127,13 @@ impl<'de> Input<'de> for SliceInput<'de> {
         Ok(next_chunk)
     }
 
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
+    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
         if !self.next_chunk_has_been_called {
-            panic!("Called `SliceInput::last_chunk` before `next_chunk`.");
+            panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
 
         if self.has_returned_eof {
-            panic!("Called `SliceInput::last_chunk` after `next_chunk` returned `Eof`.");
+            panic!("Called `SliceInput::current_chunk` after `next_chunk` returned `Eof`.");
         }
 
         InputRef::Borrowed(self.curr_chunk)
@@ -208,13 +208,13 @@ where
         Ok(chunk)
     }
 
-    fn last_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
+    fn current_chunk<'s>(&'s self) -> InputRef<'de, 's, [u8]> {
         if !self.next_chunk_has_been_called {
-            panic!("Called `SliceInput::last_chunk` before `next_chunk`.");
+            panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
 
         if self.has_returned_eof {
-            panic!("Called `SliceInput::last_chunk` after `next_chunk` returned `Eof`.");
+            panic!("Called `SliceInput::current_chunk` after `next_chunk` returned `Eof`.");
         }
 
         InputRef::Transient(self.curr_chunk())
@@ -227,7 +227,7 @@ pub(crate) mod tests {
 
     pub struct ExplicitChunksInput {
         remaining_chunks: Vec<&'static [u8]>,
-        last_chunk: Option<&'static [u8]>,
+        current_chunk: Option<&'static [u8]>,
     }
 
     impl super::private::Sealed for ExplicitChunksInput {}
@@ -239,7 +239,7 @@ pub(crate) mod tests {
 
             ExplicitChunksInput {
                 remaining_chunks: chunks,
-                last_chunk: None,
+                current_chunk: None,
             }
         }
     }
@@ -248,18 +248,18 @@ pub(crate) mod tests {
         fn next_chunk(&mut self) -> io::Result<InputChunk<'_>> {
             match self.remaining_chunks.pop() {
                 None => {
-                    self.last_chunk = None;
+                    self.current_chunk = None;
                     Ok(InputChunk::Eof)
                 }
                 Some(chunk) => {
-                    self.last_chunk = Some(chunk);
+                    self.current_chunk = Some(chunk);
                     Ok(InputChunk::Data(chunk))
                 }
             }
         }
 
-        fn last_chunk<'s>(&'s self) -> InputRef<'a, 's, [u8]> {
-            InputRef::Transient(self.last_chunk.unwrap())
+        fn current_chunk<'s>(&'s self) -> InputRef<'a, 's, [u8]> {
+            InputRef::Transient(self.current_chunk.unwrap())
         }
     }
 }
