@@ -1,4 +1,4 @@
-main
+v0.0.3 (2025-12-13)
 ===
 - Actually escape atoms during serialization
 
