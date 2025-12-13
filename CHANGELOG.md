@@ -1,3 +1,7 @@
+main
+===
+- Actually escape atoms during serialization
+
 v0.0.2 (2025-11-22)
 ====
 - Rework low-level API to expose `RawTokenTape` trait

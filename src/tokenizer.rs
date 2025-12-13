@@ -80,7 +80,7 @@ impl RawBytes {
         unsafe { &*(bytes as *const [u8] as *const RawBytes) }
     }
 
-    pub fn bytes(&self) -> &[u8] {
+    pub fn raw_bytes(&self) -> &[u8] {
         &self.0
     }
 
@@ -454,7 +454,7 @@ pub trait RawTokenTape {
 // - Quoted atoms:
 //   - Backslash escapes:
 //     - character escapes: \ ' " <space> (backlash, single/double quote, space)
-//     - control escapes: n t b r (newline, tab, backspace, tab)
+//     - control escapes: n t b r (newline, tab, backspace, carriage return)
 //     - decimal escape: \ddd -> ddd (in decimal) as a byte
 //       - it is a _lexer_ error if ddd > 255 (this seems silly; we won't do this)
 //     - hexadecimal escape: \xhh -> hh (in hexadecimal) as a byte
@@ -1227,17 +1227,17 @@ mod tests {
             RawToken::SexpComment => "SexpComment: #;".to_owned(),
             RawToken::Atom(raw_bytes) => {
                 let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.bytes().as_bstr();
+                let bytes = raw_bytes.raw_bytes().as_bstr();
                 format!("Atom: {:?} ({})", bytes, ref_kind)
             }
             RawToken::LineComment(raw_bytes) => {
                 let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.bytes().as_bstr();
+                let bytes = raw_bytes.raw_bytes().as_bstr();
                 format!("LineComment: {:?} ({})", bytes, ref_kind)
             }
             RawToken::BlockComment(raw_bytes) => {
                 let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.bytes().as_bstr();
+                let bytes = raw_bytes.raw_bytes().as_bstr();
                 format!("BlockComment: {:?} ({})", bytes, ref_kind)
             }
         }

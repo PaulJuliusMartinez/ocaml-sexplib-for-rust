@@ -99,12 +99,19 @@ impl<W: io::Write> TokenWriter<W> {
         }
     }
 
-    pub fn write_atom(&mut self, s: &str) -> io::Result<()> {
-        let atom = Atom::new(s);
+    fn write_atom(&mut self, atom: Atom<'_>) -> io::Result<()> {
         match self.writer {
             Writer::Standard(ref mut writer) => writer.write_atom(&mut self.w, atom),
             Writer::Machine(ref mut writer) => writer.write_atom(&mut self.w, atom),
         }
+    }
+
+    pub fn write_str_atom(&mut self, s: &str) -> io::Result<()> {
+        self.write_atom(Atom::new_from_str(s))
+    }
+
+    pub fn write_bytes_atom(&mut self, bytes: &[u8]) -> io::Result<()> {
+        self.write_atom(Atom::new(bytes))
     }
 
     pub fn end_list(&mut self) -> io::Result<()> {
@@ -138,25 +145,25 @@ mod tests {
 
     #[test]
     fn test_standard() -> io::Result<()> {
-        let s = with_style(Style::Standard, |w| w.write_atom("a"))?;
+        let s = with_style(Style::Standard, |w| w.write_str_atom("a"))?;
         assert_snapshot!(s, @"a");
 
-        let s = with_style(Style::Standard, |w| w.write_atom("a b"))?;
+        let s = with_style(Style::Standard, |w| w.write_str_atom("a b"))?;
         assert_snapshot!(s, @r#""a b""#);
 
         let s = with_style(Style::Standard, |w| {
             w.start_list()?;
-            w.write_atom("a")?;
-            w.write_atom("b c")?;
-            w.write_atom("d")?;
+            w.write_str_atom("a")?;
+            w.write_str_atom("b c")?;
+            w.write_str_atom("d")?;
             w.start_list()?;
-            w.write_atom("e f")?;
+            w.write_str_atom("e f")?;
             w.start_list()?;
             w.start_list()?;
             w.end_list()?;
             w.end_list()?;
             w.end_list()?;
-            w.write_atom("z")?;
+            w.write_str_atom("z")?;
             w.end_list()
         })?;
 
@@ -167,20 +174,20 @@ mod tests {
 
     #[test]
     fn test_machine() -> io::Result<()> {
-        let s = with_style(Style::Machine, |w| w.write_atom("a"))?;
+        let s = with_style(Style::Machine, |w| w.write_str_atom("a"))?;
         assert_snapshot!(s, @"a");
 
-        let s = with_style(Style::Machine, |w| w.write_atom("a b"))?;
+        let s = with_style(Style::Machine, |w| w.write_str_atom("a b"))?;
         assert_snapshot!(s, @r#""a b""#);
 
         let s = with_style(Style::Machine, |w| {
             w.start_list()?;
-            w.write_atom("a")?;
-            w.write_atom("b")?;
-            w.write_atom("c d")?;
-            w.write_atom("e")?;
-            w.write_atom("f g")?;
-            w.write_atom("h i")?;
+            w.write_str_atom("a")?;
+            w.write_str_atom("b")?;
+            w.write_str_atom("c d")?;
+            w.write_str_atom("e")?;
+            w.write_str_atom("f g")?;
+            w.write_str_atom("h i")?;
             w.end_list()
         })?;
 

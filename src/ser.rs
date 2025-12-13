@@ -65,13 +65,13 @@ where
 
     fn serialize_bool(self, v: bool) -> Result<()> {
         let atom = if v { "true" } else { "false" };
-        self.token_writer.write_atom(atom).map_err(Error::io)
+        self.token_writer.write_str_atom(atom).map_err(Error::io)
     }
 
     fn serialize_i64(self, v: i64) -> Result<()> {
         // Someday: Maybe use itoa crate?
         let atom = v.to_string();
-        self.token_writer.write_atom(&atom).map_err(Error::io)
+        self.token_writer.write_str_atom(&atom).map_err(Error::io)
     }
 
     fn serialize_i32(self, v: i32) -> Result<()> {
@@ -89,7 +89,7 @@ where
     fn serialize_u64(self, v: u64) -> Result<()> {
         // Someday: Maybe use itoa crate?
         let atom = v.to_string();
-        self.token_writer.write_atom(&atom).map_err(Error::io)
+        self.token_writer.write_str_atom(&atom).map_err(Error::io)
     }
 
     fn serialize_u32(self, v: u32) -> Result<()> {
@@ -106,28 +106,26 @@ where
 
     fn serialize_f64(self, v: f64) -> Result<()> {
         let atom = v.to_string();
-        self.token_writer.write_atom(&atom).map_err(Error::io)
+        self.token_writer.write_str_atom(&atom).map_err(Error::io)
     }
 
     fn serialize_f32(self, v: f32) -> Result<()> {
         let atom = v.to_string();
-        self.token_writer.write_atom(&atom).map_err(Error::io)
+        self.token_writer.write_str_atom(&atom).map_err(Error::io)
     }
 
     fn serialize_str(self, v: &str) -> Result<()> {
-        self.token_writer.write_atom(v).map_err(Error::io)
+        self.token_writer.write_str_atom(v).map_err(Error::io)
     }
 
     fn serialize_char(self, v: char) -> Result<()> {
         // Someday: Do this without allocating?
         let ch = v.to_string();
-        self.token_writer.write_atom(&ch).map_err(Error::io)
+        self.token_writer.write_str_atom(&ch).map_err(Error::io)
     }
 
-    fn serialize_bytes(self, _v: &[u8]) -> Result<()> {
-        Err(Error::SerializationError(
-            "writing bytes is not supported".to_string(),
-        ))
+    fn serialize_bytes(self, v: &[u8]) -> Result<()> {
+        self.token_writer.write_bytes_atom(v).map_err(Error::io)
     }
 
     fn serialize_unit(self) -> Result<()> {
@@ -149,7 +147,7 @@ where
 
     // e.g. `struct Foo;`
     fn serialize_unit_struct(self, name: &'static str) -> Result<()> {
-        self.token_writer.write_atom(name).map_err(Error::io)
+        self.token_writer.write_str_atom(name).map_err(Error::io)
     }
 
     // e.g. `E::A` in `enum { A, B(i64), C(i32, i32), D { x: bool, y: char } }`
@@ -159,7 +157,7 @@ where
         _variant_index: u32,
         variant: &'static str,
     ) -> Result<()> {
-        self.token_writer.write_atom(variant).map_err(Error::io)
+        self.token_writer.write_str_atom(variant).map_err(Error::io)
     }
 
     // e.g. `struct PhoneNumber(String)`
@@ -182,7 +180,9 @@ where
         T: ?Sized + Serialize,
     {
         self.token_writer.start_list().map_err(Error::io)?;
-        self.token_writer.write_atom(variant).map_err(Error::io)?;
+        self.token_writer
+            .write_str_atom(variant)
+            .map_err(Error::io)?;
         value.serialize(&mut *self)?;
         self.token_writer.end_list().map_err(Error::io)
     }
@@ -214,7 +214,9 @@ where
         _len: usize,
     ) -> Result<Self::SerializeTupleVariant> {
         self.token_writer.start_list().map_err(Error::io)?;
-        self.token_writer.write_atom(variant).map_err(Error::io)?;
+        self.token_writer
+            .write_str_atom(variant)
+            .map_err(Error::io)?;
         Ok(self)
     }
 
@@ -235,7 +237,9 @@ where
         _len: usize,
     ) -> Result<Self::SerializeStructVariant> {
         self.token_writer.start_list().map_err(Error::io)?;
-        self.token_writer.write_atom(variant).map_err(Error::io)?;
+        self.token_writer
+            .write_str_atom(variant)
+            .map_err(Error::io)?;
         Ok(self)
     }
 }
@@ -276,7 +280,7 @@ macro_rules! impl_key_value_pair_serializer {
                 T: ?Sized + Serialize,
             {
                 self.token_writer.start_list().map_err(Error::io)?;
-                self.token_writer.write_atom(key).map_err(Error::io)?;
+                self.token_writer.write_str_atom(key).map_err(Error::io)?;
                 value.serialize(&mut **self)?;
                 self.token_writer.end_list().map_err(Error::io)
             }
@@ -348,8 +352,62 @@ mod tests {
     #[test]
     fn test_strings() {
         assert_snapshot!(to_string(&"abc").unwrap(), @"abc");
+        assert_snapshot!(to_string(&"x y z").unwrap(), @"\"x y z\"");
         // byte strings are serialized as arrays of bytes by default due to limitations in Rust.
         assert_snapshot!(to_string(&b"abc").unwrap(), @"(97 98 99)");
+    }
+
+    #[test]
+    fn test_string_escaping() {
+        assert_snapshot!(to_string(&"a\nb").unwrap(), @r#""a\nb""#);
+        assert_snapshot!(to_string(&"a\tb").unwrap(), @r#""a\tb""#);
+        assert_snapshot!(to_string(&"a\rb").unwrap(), @r#""a\rb""#);
+        assert_snapshot!(to_string(&"a\x0bb").unwrap(), @r#""a\x0bb""#);
+        assert_snapshot!(to_string(&"a\"b").unwrap(), @r#""a\"b""#);
+        assert_snapshot!(to_string(&"a\\b").unwrap(), @r#""a\\b""#);
+        assert_snapshot!(to_string(&"a\\b").unwrap(), @r#""a\\b""#);
+        assert_snapshot!(to_string(&"a\0b").unwrap(), @r#""a\x00b""#);
+
+        // Non-breaking space
+        assert_snapshot!(to_string(&"a\u{00A0}b").unwrap(), @r#""a\xc2\xa0b""#);
+        // Zero-width joiner
+        assert_snapshot!(to_string(&"a\u{200D}b").unwrap(), @r#""a\xe2\x80\x8db""#);
+        // Bactrian Camel
+        assert_snapshot!(to_string(&"a🐫b").unwrap(), @"a🐫b");
+    }
+
+    #[test]
+    fn test_bytes() {
+        #[derive(Serialize)]
+        struct ByteStruct<'a> {
+            #[serde(with = "serde_bytes")]
+            bytes: &'a [u8],
+            #[serde(with = "serde_bytes")]
+            byte_vec: Vec<u8>,
+            #[serde(with = "serde_bytes")]
+            byte_array: [u8; 2],
+        }
+
+        let byte1 = 0xCE;
+        let byte2 = 0xB1;
+        let good_bytes = [byte1, byte2];
+        assert_snapshot!(to_string(serde_bytes::Bytes::new(&good_bytes)).unwrap(), @"α");
+
+        let byte_struct = ByteStruct {
+            bytes: &good_bytes,
+            byte_vec: good_bytes.to_vec(),
+            byte_array: [byte1, byte2],
+        };
+        assert_snapshot!(to_string(&byte_struct).unwrap(), @"((bytes α) (byte_vec α) (byte_array α))");
+
+        let byte3 = b'a';
+        let bad_bytes = [byte3, byte2];
+        let byte_struct = ByteStruct {
+            bytes: &bad_bytes,
+            byte_vec: bad_bytes.to_vec(),
+            byte_array: [byte3, byte2],
+        };
+        assert_snapshot!(to_string(&byte_struct).unwrap(), @r#"((bytes "a\xb1") (byte_vec "a\xb1") (byte_array "a\xb1"))"#);
     }
 
     #[test]
