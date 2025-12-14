@@ -6,13 +6,13 @@
 // `is_empty` sometimes makes something too much like a collection.
 #![allow(clippy::len_zero)]
 
-mod atom;
+pub mod atom;
 pub mod de;
 pub mod error;
 pub mod input;
 pub mod ser;
 pub mod sexp;
-mod token_writer;
+pub mod token_writer;
 pub mod tokenizer;
 
 pub use sexp::Sexp;

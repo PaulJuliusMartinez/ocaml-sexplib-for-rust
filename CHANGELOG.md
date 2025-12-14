@@ -1,3 +1,7 @@
+main
+===
+- Make `atom` and `token_writer` modules public
+
 v0.0.3 (2025-12-13)
 ===
 - Actually escape atoms during serialization
