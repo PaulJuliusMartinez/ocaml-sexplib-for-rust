@@ -127,38 +127,12 @@ impl<'a> Atom<'a> {
     pub fn write<W: io::Write>(&self, mut w: W) -> io::Result<()> {
         match self {
             Atom::DoesNotNeedToBeQuoted(s) => write!(w, "{}", s),
-            Atom::NeedsToBeQuoted(mut bytes) => {
+            Atom::NeedsToBeQuoted(bytes) => {
                 write!(w, "\"")?;
 
-                while !bytes.is_empty() {
-                    let utf8_error = match std::str::from_utf8(bytes) {
-                        Ok(s) => {
-                            write_escaped_str(&mut w, s)?;
-                            break;
-                        }
-                        Err(err) => err,
-                    };
-
-                    let valid_len = utf8_error.valid_up_to();
-                    let error_len = match utf8_error.error_len() {
-                        Some(len) => len,
-                        None => bytes.len() - valid_len,
-                    };
-
-                    let (valid_segment, rest) = bytes.split_at(valid_len);
-                    let (error_segment, rest) = rest.split_at(error_len);
-                    bytes = rest;
-
-                    if valid_len > 0 {
-                        // `valid_up_to` is the maximum index such that
-                        // `from_utf8(&input[..index])` would return Ok(_).
-                        let valid_utf8_segment =
-                            unsafe { std::str::from_utf8_unchecked(valid_segment) };
-
-                        write_escaped_str(&mut w, valid_utf8_segment)?;
-                    }
-
-                    write_hex_bytes(&mut w, error_segment)?;
+                for chunk in bytes.utf8_chunks() {
+                    write_escaped_str(&mut w, chunk.valid())?;
+                    write_hex_bytes(&mut w, chunk.invalid())?;
                 }
 
                 write!(w, "\"")
