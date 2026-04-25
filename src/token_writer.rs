@@ -1,6 +1,6 @@
 use std::io;
 
-use crate::atom::Atom;
+use crate::atom::AtomData;
 
 struct StandardWriter {
     just_started_new_list: bool,
@@ -22,12 +22,12 @@ impl StandardWriter {
         write!(w, "(")
     }
 
-    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
+    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: &AtomData) -> io::Result<()> {
         if !self.just_started_new_list {
             write!(w, " ")?;
         }
         self.just_started_new_list = false;
-        atom.write(w)
+        atom.serialize_io(w)
     }
 
     fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
@@ -52,13 +52,13 @@ impl MachineWriter {
         write!(w, "(")
     }
 
-    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: Atom) -> io::Result<()> {
+    fn write_atom<W: io::Write>(&mut self, mut w: W, atom: &AtomData) -> io::Result<()> {
         let is_unquoted = !atom.needs_to_be_quoted();
         if self.need_space_before_next_unquoted_atom && is_unquoted {
             write!(w, " ")?;
         }
         self.need_space_before_next_unquoted_atom = is_unquoted;
-        atom.write(w)
+        atom.serialize_io(w)
     }
 
     fn end_list<W: io::Write>(&mut self, mut w: W) -> io::Result<()> {
@@ -99,7 +99,7 @@ impl<W: io::Write> TokenWriter<W> {
         }
     }
 
-    fn write_atom(&mut self, atom: Atom<'_>) -> io::Result<()> {
+    fn write_atom(&mut self, atom: &AtomData) -> io::Result<()> {
         match self.writer {
             Writer::Standard(ref mut writer) => writer.write_atom(&mut self.w, atom),
             Writer::Machine(ref mut writer) => writer.write_atom(&mut self.w, atom),
@@ -107,11 +107,11 @@ impl<W: io::Write> TokenWriter<W> {
     }
 
     pub fn write_str_atom(&mut self, s: &str) -> io::Result<()> {
-        self.write_atom(Atom::new_from_str(s))
+        self.write_atom(AtomData::new(s.as_bytes()))
     }
 
     pub fn write_bytes_atom(&mut self, bytes: &[u8]) -> io::Result<()> {
-        self.write_atom(Atom::new(bytes))
+        self.write_atom(AtomData::new(bytes))
     }
 
     pub fn end_list(&mut self) -> io::Result<()> {

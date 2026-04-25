@@ -1,6 +1,7 @@
 main
 ===
 - Make `atom` and `token_writer` modules public
+- Rework `atom` module to expose separate types for atom data vs serialized atom data
 
 v0.0.3 (2025-12-13)
 ===
@@ -10,7 +11,6 @@ v0.0.2 (2025-11-22)
 ====
 - Rework low-level API to expose `RawTokenTape` trait
 - Remove unused `CallNextRawTokenToGetTheRealError`
-
 
 v0.0.1 (2025-08-18)
 ===================
