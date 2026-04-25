@@ -2,6 +2,7 @@ main
 ===
 - Make `atom` and `token_writer` modules public
 - Rework `atom` module to expose separate types for atom data vs serialized atom data
+- Rename `InputRef` to `Ref` and move it to a top-level crate item
 
 v0.0.3 (2025-12-13)
 ===

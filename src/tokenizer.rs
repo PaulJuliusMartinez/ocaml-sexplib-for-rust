@@ -2,12 +2,13 @@ use std::collections::VecDeque;
 use std::ops::{Deref, Range};
 
 use crate::error::Result;
-use crate::input::{Input, InputChunk, InputRef};
+use crate::input::{Input, InputChunk};
+use crate::Ref;
 
 #[derive(Debug)]
 pub enum Token<'de, 't> {
     LeftParen,
-    Atom(InputRef<'de, 't, UnescapedBytes>),
+    Atom(Ref<'de, 't, UnescapedBytes>),
     RightParen,
 }
 
@@ -355,9 +356,9 @@ impl Deref for UnescapedBytes {
 pub enum RawToken<'de, 't> {
     LeftParen,
     RightParen,
-    Atom(InputRef<'de, 't, RawBytes>),
-    LineComment(InputRef<'de, 't, RawBytes>),
-    BlockComment(InputRef<'de, 't, RawBytes>),
+    Atom(Ref<'de, 't, RawBytes>),
+    LineComment(Ref<'de, 't, RawBytes>),
+    BlockComment(Ref<'de, 't, RawBytes>),
     SexpComment,
 }
 
@@ -373,12 +374,12 @@ pub enum RawTokenKind {
 
 impl<'de, 't> RawToken<'de, 't> {
     fn from_token_bytes_and_kind(
-        token_bytes: InputRef<'de, 't, [u8]>,
+        token_bytes: Ref<'de, 't, [u8]>,
         kind: VarTokenKind,
     ) -> RawToken<'de, 't> {
         let raw_bytes = match token_bytes {
-            InputRef::Borrowed(bytes) => InputRef::Borrowed(RawBytes::new(bytes)),
-            InputRef::Transient(bytes) => InputRef::Transient(RawBytes::new(bytes)),
+            Ref::Borrowed(bytes) => Ref::Borrowed(RawBytes::new(bytes)),
+            Ref::Transient(bytes) => Ref::Transient(RawBytes::new(bytes)),
         };
 
         match kind {
@@ -426,7 +427,7 @@ pub trait RawTokenTape {
     fn next_raw_token<'de, 't>(
         &'t mut self,
         witness: HasEnoughData,
-        current_data: Option<InputRef<'de, 't, [u8]>>,
+        current_data: Option<Ref<'de, 't, [u8]>>,
     ) -> Result<Option<RawToken<'de, 't>>>;
 
     fn peek_raw_token_kind(&self, witness: &HasEnoughData) -> Result<Option<RawTokenKind>>;
@@ -619,7 +620,7 @@ impl RawTokenTape for BasicTapeTokenizer {
     fn next_raw_token<'de, 't>(
         &'t mut self,
         _: HasEnoughData,
-        current_data: Option<InputRef<'de, 't, [u8]>>,
+        current_data: Option<Ref<'de, 't, [u8]>>,
     ) -> Result<Option<RawToken<'de, 't>>> {
         match self.raw_token_refs.pop_front() {
             None => Ok(None),
@@ -631,9 +632,9 @@ impl RawTokenTape for BasicTapeTokenizer {
                     RawTokenRef::SexpComment => RawToken::SexpComment,
                     RawTokenRef::VarToken(raw_token_ref_data, token_kind) => {
                         let raw_token_bytes = match raw_token_ref_data {
-                            RawTokenRefData::Scratch => InputRef::Transient(
-                                self.scratch_buffer_for_a_previous_token.as_slice(),
-                            ),
+                            RawTokenRefData::Scratch => {
+                                Ref::Transient(self.scratch_buffer_for_a_previous_token.as_slice())
+                            }
                             RawTokenRefData::Range(range) => match current_data {
                                 Some(data) => data.index(range.clone()),
                                 None => panic!("TapeTokenizer has stale `Range` ref."),
@@ -1124,18 +1125,16 @@ where
                     };
 
                     let atom = match atom_bytes {
-                        InputRef::Borrowed(bytes) => {
+                        Ref::Borrowed(bytes) => {
                             match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
-                                UnescapeResult::NoUnescapingNeeded(atom) => {
-                                    InputRef::Borrowed(atom)
-                                }
-                                UnescapeResult::Escaped(atom) => InputRef::Transient(atom),
+                                UnescapeResult::NoUnescapingNeeded(atom) => Ref::Borrowed(atom),
+                                UnescapeResult::Escaped(atom) => Ref::Transient(atom),
                             }
                         }
-                        InputRef::Transient(bytes) => {
+                        Ref::Transient(bytes) => {
                             match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
                                 UnescapeResult::NoUnescapingNeeded(atom)
-                                | UnescapeResult::Escaped(atom) => InputRef::Transient(atom),
+                                | UnescapeResult::Escaped(atom) => Ref::Transient(atom),
                             }
                         }
                     };
@@ -1166,7 +1165,8 @@ mod tests {
     use super::*;
     use crate::error;
     use crate::input::tests::ExplicitChunksInput;
-    use crate::input::{InputRef, SliceInput};
+    use crate::input::SliceInput;
+    use crate::Ref;
 
     use bstr::ByteSlice;
     use insta::assert_snapshot;
@@ -1214,10 +1214,10 @@ mod tests {
     }
 
     fn format_raw_token(raw_token: RawToken<'_, '_>) -> String {
-        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_, RawBytes>) -> &'static str {
+        fn borrowed_or_owned(token_bytes: &Ref<'_, '_, RawBytes>) -> &'static str {
             match token_bytes {
-                InputRef::Borrowed(_) => "borrowed",
-                InputRef::Transient(_) => "transient",
+                Ref::Borrowed(_) => "borrowed",
+                Ref::Transient(_) => "transient",
             }
         }
 
@@ -1618,10 +1618,10 @@ mod tests {
     }
 
     fn format_token(token: Token<'_, '_>) -> String {
-        fn borrowed_or_owned(token_bytes: &InputRef<'_, '_, UnescapedBytes>) -> &'static str {
+        fn borrowed_or_owned(token_bytes: &Ref<'_, '_, UnescapedBytes>) -> &'static str {
             match token_bytes {
-                InputRef::Borrowed(_) => "borrowed",
-                InputRef::Transient(_) => "transient",
+                Ref::Borrowed(_) => "borrowed",
+                Ref::Transient(_) => "transient",
             }
         }
 

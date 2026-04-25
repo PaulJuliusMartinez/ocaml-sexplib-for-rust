@@ -8,8 +8,9 @@ use serde::de::{
 use serde::Deserialize;
 
 use crate::error::{Error, Result};
-use crate::input::{InputRef, SliceInput};
+use crate::input::SliceInput;
 use crate::tokenizer::{Token, TokenIterator, TokenKind, Tokenizer, UnescapedBytes};
+use crate::Ref;
 
 #[derive(Debug)]
 pub struct Deserializer<I> {
@@ -52,7 +53,7 @@ where
         let _ = self.tokens.next();
     }
 
-    fn expect_atom<'t>(&'t mut self) -> Result<InputRef<'de, 't, UnescapedBytes>> {
+    fn expect_atom<'t>(&'t mut self) -> Result<Ref<'de, 't, UnescapedBytes>> {
         match self.next()? {
             None => error("expected atom; reached end of input"),
             Some(Token::LeftParen) => error("expected atom; got list"),
@@ -588,7 +589,7 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
-    use crate::input::InputRef;
+    use crate::Ref;
 
     impl<'de> TokenIterator<'de> for Vec<Token<'de, '_>> {
         fn next<'t>(&'t mut self) -> Result<Option<Token<'de, 't>>> {
@@ -610,7 +611,7 @@ mod tests {
     }
 
     fn a(s: &'static str) -> Token<'static, '_> {
-        Token::Atom(InputRef::Borrowed(UnescapedBytes::new(s.as_bytes())))
+        Token::Atom(Ref::Borrowed(UnescapedBytes::new(s.as_bytes())))
     }
 
     const LP: Token = Token::LeftParen;

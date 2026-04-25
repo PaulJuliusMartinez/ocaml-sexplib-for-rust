@@ -1,6 +1,8 @@
 use std::io;
 use std::ops::{Deref, Range};
 
+use crate::Ref;
+
 pub trait Input<'de>: private::Sealed {
     /// Returns the next chunk of input data to be processed by the tokenizer,
     /// or `Eof` to indicate that no more data is available.
@@ -9,7 +11,7 @@ pub trait Input<'de>: private::Sealed {
     /// Returns a reference to the same data returned by the last call to
     /// `next_chunk` if `next_chunk` returned `Data`. Returns `None` if
     /// `next_chunk` return `Eof`.
-    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>>;
+    fn current_chunk<'s>(&'s self) -> Option<Ref<'de, 's, [u8]>>;
 }
 
 mod private {
@@ -19,38 +21,6 @@ mod private {
 pub enum InputChunk<'t> {
     Data(&'t [u8]),
     Eof,
-}
-
-#[derive(Debug)]
-pub enum InputRef<'de, 't, T>
-where
-    T: ?Sized,
-{
-    Borrowed(&'de T),
-    Transient(&'t T),
-}
-
-impl<'de, 't> InputRef<'de, 't, [u8]> {
-    pub fn index(&self, range: Range<usize>) -> InputRef<'de, 't, [u8]> {
-        match self {
-            InputRef::Borrowed(bytes) => InputRef::Borrowed(&bytes[range]),
-            InputRef::Transient(bytes) => InputRef::Transient(&bytes[range]),
-        }
-    }
-}
-
-impl<'de, 't, T> Deref for InputRef<'de, 't, T>
-where
-    T: ?Sized,
-{
-    type Target = T;
-
-    fn deref(&self) -> &T {
-        match *self {
-            InputRef::Borrowed(de) => de,
-            InputRef::Transient(t) => t,
-        }
-    }
 }
 
 /// Input source that reads from a slice of bytes.
@@ -126,7 +96,7 @@ impl<'de> Input<'de> for SliceInput<'de> {
         Ok(next_chunk)
     }
 
-    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>> {
+    fn current_chunk<'s>(&'s self) -> Option<Ref<'de, 's, [u8]>> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
@@ -134,7 +104,7 @@ impl<'de> Input<'de> for SliceInput<'de> {
         if self.has_returned_eof {
             None
         } else {
-            Some(InputRef::Borrowed(self.curr_chunk))
+            Some(Ref::Borrowed(self.curr_chunk))
         }
     }
 }
@@ -207,7 +177,7 @@ where
         Ok(chunk)
     }
 
-    fn current_chunk<'s>(&'s self) -> Option<InputRef<'de, 's, [u8]>> {
+    fn current_chunk<'s>(&'s self) -> Option<Ref<'de, 's, [u8]>> {
         if !self.next_chunk_has_been_called {
             panic!("Called `SliceInput::current_chunk` before `next_chunk`.");
         }
@@ -215,7 +185,7 @@ where
         if self.has_returned_eof {
             None
         } else {
-            Some(InputRef::Transient(self.curr_chunk()))
+            Some(Ref::Transient(self.curr_chunk()))
         }
     }
 }
@@ -257,10 +227,10 @@ pub(crate) mod tests {
             }
         }
 
-        fn current_chunk<'s>(&'s self) -> Option<InputRef<'a, 's, [u8]>> {
+        fn current_chunk<'s>(&'s self) -> Option<Ref<'a, 's, [u8]>> {
             match self.current_chunk {
                 None => None,
-                Some(chunk) => Some(InputRef::Transient(chunk)),
+                Some(chunk) => Some(Ref::Transient(chunk)),
             }
         }
     }

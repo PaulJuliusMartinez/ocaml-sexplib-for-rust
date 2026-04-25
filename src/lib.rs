@@ -6,6 +6,8 @@
 // `is_empty` sometimes makes something too much like a collection.
 #![allow(clippy::len_zero)]
 
+use std::ops::{Deref, Range};
+
 pub mod atom;
 pub mod de;
 pub mod error;
@@ -25,3 +27,40 @@ pub use error::{Error, Result};
 pub use ser::{to_string, to_string_mach, to_writer, to_writer_mach, Serializer};
 pub use sexp::de::from_sexp;
 pub use sexp::ser::to_sexp;
+
+// Can't name a module "ref", so I guess we'll just put this as the top-level.
+
+/// A fundamental wrapper type that provides a building block for zero-copy deserialization. Similar
+/// to how [`std::borrow::Cow`] represents borrowed or owned data, [`Ref`] represents borrowed data
+/// or "transient" data that isn't as long lived, e.g. a scratch buffer.
+#[derive(Debug)]
+pub enum Ref<'de, 't, T>
+where
+    T: ?Sized,
+{
+    Borrowed(&'de T),
+    Transient(&'t T),
+}
+
+impl<'de, 't, T> Deref for Ref<'de, 't, T>
+where
+    T: ?Sized,
+{
+    type Target = T;
+
+    fn deref(&self) -> &T {
+        match *self {
+            Ref::Borrowed(de) => de,
+            Ref::Transient(t) => t,
+        }
+    }
+}
+
+impl<'de, 't> Ref<'de, 't, [u8]> {
+    pub fn index(&self, range: Range<usize>) -> Ref<'de, 't, [u8]> {
+        match self {
+            Ref::Borrowed(bytes) => Ref::Borrowed(&bytes[range]),
+            Ref::Transient(bytes) => Ref::Transient(&bytes[range]),
+        }
+    }
+}
