@@ -1,3 +1,4 @@
+use std::fmt;
 use std::io;
 
 use crate::error::TokenizationError;
@@ -5,16 +6,22 @@ use crate::Ref;
 
 /// This is a wrapper type around the actual data in a sexp atom. If the serialized
 /// version of an atom looks like this:
-/// ```
+/// ```text
 /// "a\"b\nc"
 /// ```
 /// then the contents raw data inside the `AtomData` is:
-/// ```
+/// ```text
 /// [ b'a', b'"', b'b', b'\n', b'c']
 /// ```
 #[derive(Debug)]
 #[repr(transparent)]
 pub struct AtomData([u8]);
+
+macro_rules! escape_hex_byte {
+    ($w:expr, $b:expr) => {
+        write!($w, "\\x{:02x}", $b)
+    };
+}
 
 impl AtomData {
     pub fn new(data: &[u8]) -> &AtomData {
@@ -32,14 +39,38 @@ impl AtomData {
             write!(w, "\"")?;
 
             for chunk in self.0.utf8_chunks() {
-                serialize_escaped_str(&mut w, chunk.valid())?;
-                serialize_hex_bytes(&mut w, chunk.invalid())?;
+                escape_str_io(&mut w, chunk.valid())?;
+                for b in chunk.invalid().iter() {
+                    escape_hex_byte!(w, b)?;
+                }
             }
 
             write!(w, "\"")
         } else {
             w.write_all(&self.0)
         }
+    }
+
+    pub fn serialize_fmt<W: fmt::Write>(&self, mut w: W) -> fmt::Result {
+        if !self.needs_to_be_quoted() {
+            // This should always be be the case.
+            if let Ok(s) = std::str::from_utf8(self.bytes()) {
+                return write!(w, "{}", s);
+            }
+        }
+
+        write!(w, "\"")?;
+
+        for chunk in self.0.utf8_chunks() {
+            escape_str_fmt(&mut w, chunk.valid())?;
+            for b in chunk.invalid().iter() {
+                escape_hex_byte!(w, b)?;
+            }
+        }
+
+        write!(w, "\"")?;
+
+        Ok(())
     }
 
     // sexplib0 quotes empty strings, strings containing ' ', '"', '(', ')', ';' and
@@ -328,51 +359,46 @@ impl PlausibleSerializedAtom {
     }
 }
 
-fn serialize_escaped_str<W: io::Write>(mut w: W, s: &str) -> io::Result<()> {
-    for ch in s.chars() {
-        if ch.is_ascii() {
-            match ch {
-                '"' => write!(w, "\\\"")?,
-                '\\' => write!(w, "\\\\")?,
-                '\n' => write!(w, "\\n")?,
-                '\r' => write!(w, "\\r")?,
-                '\t' => write!(w, "\\t")?,
-                '\x08' => write!(w, "\\b")?,
-                // Control characters and DEL
-                '\x00'..='\x1f' | '\x7f' => {
-                    serialize_hex_byte(&mut w, ch as u32 as u8)?;
+macro_rules! escape_str {
+    ($escape_str_fn:ident, $write_trait:path, $write_result:ty) => {
+        fn $escape_str_fn<W: $write_trait>(mut w: W, s: &str) -> $write_result {
+            for ch in s.chars() {
+                if ch.is_ascii() {
+                    match ch {
+                        '"' => write!(w, "\\\"")?,
+                        '\\' => write!(w, "\\\\")?,
+                        '\n' => write!(w, "\\n")?,
+                        '\r' => write!(w, "\\r")?,
+                        '\t' => write!(w, "\\t")?,
+                        '\x08' => write!(w, "\\b")?,
+                        // Control characters and DEL
+                        '\x00'..='\x1f' | '\x7f' => {
+                            escape_hex_byte!(w, ch as u32 as u8)?;
+                        }
+                        _ => write!(w, "{}", ch)?,
+                    }
+                } else {
+                    if is_debug_printable_non_ascii_char(ch) {
+                        write!(w, "{}", ch)?;
+                    } else {
+                        let mut utf8_bytes = [0; 4];
+                        for b in ch.encode_utf8(&mut utf8_bytes).as_bytes() {
+                            escape_hex_byte!(&mut w, *b)?;
+                        }
+                    }
                 }
-                _ => write!(w, "{}", ch)?,
             }
-        } else {
-            if is_debug_printable_non_ascii_char(ch) {
-                write!(w, "{}", ch)?;
-            } else {
-                let mut utf8_bytes = [0; 4];
-                for b in ch.encode_utf8(&mut utf8_bytes).as_bytes() {
-                    serialize_hex_byte(&mut w, *b)?;
-                }
-            }
-        }
-    }
 
-    Ok(())
+            Ok(())
+        }
+    };
 }
+
+escape_str!(escape_str_io, io::Write, io::Result<()>);
+escape_str!(escape_str_fmt, fmt::Write, fmt::Result);
 
 fn is_debug_printable_non_ascii_char(ch: char) -> bool {
     ch.escape_debug().count() == 1
-}
-
-fn serialize_hex_byte<W: io::Write>(mut w: W, b: u8) -> io::Result<()> {
-    write!(w, "\\x{:02x}", b)
-}
-
-fn serialize_hex_bytes<W: io::Write>(mut w: W, bytes: &[u8]) -> io::Result<()> {
-    for b in bytes.iter() {
-        write!(w, "\\x{:02x}", b)?;
-    }
-
-    Ok(())
 }
 
 #[cfg(test)]
@@ -406,11 +432,18 @@ mod tests {
     }
 
     fn escape_bytes(bytes: &[u8]) -> String {
-        let mut buf = vec![];
+        let mut byte_buf = vec![];
         let atom = AtomData::new(bytes);
-        atom.serialize_io(&mut buf).unwrap();
-        String::from_utf8(buf).unwrap()
+        atom.serialize_io(&mut byte_buf).unwrap();
+
+        let mut str_buf = String::new();
+        atom.serialize_fmt(&mut str_buf).unwrap();
+
+        assert_eq!(byte_buf.as_slice(), str_buf.as_bytes());
+
+        str_buf
     }
+
     fn escape_str(s: &str) -> String {
         escape_bytes(s.as_bytes())
     }
