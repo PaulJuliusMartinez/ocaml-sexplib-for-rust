@@ -37,14 +37,7 @@ impl AtomData {
     pub fn serialize_io<W: io::Write>(&self, mut w: W) -> io::Result<()> {
         if self.needs_to_be_quoted() {
             write!(w, "\"")?;
-
-            for chunk in self.0.utf8_chunks() {
-                escape_str_io(&mut w, chunk.valid())?;
-                for b in chunk.invalid().iter() {
-                    escape_hex_byte!(w, b)?;
-                }
-            }
-
+            escape_bytes_io(&mut w, &self.0)?;
             write!(w, "\"")
         } else {
             w.write_all(&self.0)
@@ -60,14 +53,7 @@ impl AtomData {
         }
 
         write!(w, "\"")?;
-
-        for chunk in self.0.utf8_chunks() {
-            escape_str_fmt(&mut w, chunk.valid())?;
-            for b in chunk.invalid().iter() {
-                escape_hex_byte!(w, b)?;
-            }
-        }
-
+        escape_bytes_fmt(&mut w, &self.0)?;
         write!(w, "\"")?;
 
         Ok(())
@@ -277,6 +263,7 @@ impl PlausibleSerializedAtom {
     }
 
     pub(crate) fn validate_quote_escaping(mut bytes: &[u8]) -> Result<(), TokenizationError> {
+        // Someday: Use memchr.
         while let Some(backslash_index) = bytes.iter().position(|b| *b == b'\\') {
             bytes = &bytes[backslash_index..];
 
@@ -357,35 +344,166 @@ impl PlausibleSerializedAtom {
 
         Ok(b as u8)
     }
+
+    /// For valid atoms, this is the same as `AtomData::serialize_fmt`. Otherwise, invalid
+    /// escape sequences will be passed through unchanged (unless they are invalid UTF-8).
+    /// Explicitly, the output may still not be a valid serialization.
+    pub fn normalize_serialization_even_if_invalid<W: fmt::Write>(&self, mut w: W) -> fmt::Result {
+        let bytes = self.bytes();
+
+        if bytes.len() == 0 {
+            return write!(w, "\"\"");
+        }
+
+        if bytes[0] != b'"' {
+            return AtomData::new(&bytes).serialize_fmt(w);
+        }
+
+        // Trim quotes
+        let mut bytes = &bytes[1..bytes.len() - 1];
+
+        write!(w, "\"")?;
+
+        // Someday: Use memchr
+        let mut next_backslash = bytes.iter().position(|b| *b == b'\\');
+
+        while let Some(backslash_index) = next_backslash {
+            // Nothing is escaped here, but maybe some of they bytes here should be escaped.
+            escape_bytes_fmt(&mut w, &bytes[..backslash_index])?;
+            bytes = &bytes[backslash_index + 1..];
+
+            // Unterminated backslash, we'll just keep it like that.
+            if bytes.is_empty() {
+                write!(w, "\\")?;
+                break;
+            }
+
+            let mut bytes_to_skip = 1;
+
+            match bytes[0] {
+                // These characters can be escaped, but don't need to be
+                b'\'' => write!(w, "'")?,
+                b' ' => write!(w, " ")?,
+                // These do need to be escaped
+                b'\\' => write!(w, "\\\\")?,
+                b'\"' => write!(w, "\\\"")?,
+                // Keep these control character escapes too
+                b'n' => write!(w, "\\n")?,
+                b't' => write!(w, "\\t")?,
+                b'b' => write!(w, "\\b")?,
+                b'r' => write!(w, "\\r")?,
+                _ => {
+                    if bytes[0] == b'x' || bytes[0].is_ascii_digit() {
+                        // We'll try to get the escaped byte value out of hex or decimal escape,
+                        // but if we can't, we want to pass through the bytes as untouched as
+                        // possible, while also preserving some sort of intent of the backslashes.
+                        // So something like "\xf\xab" might just be a missed hex character, and
+                        // we'll pass it along as is.
+                        let escape_sequence = &bytes[0..(usize::min(bytes.len(), 3))];
+                        if let Some(another_backslash) =
+                            escape_sequence.iter().position(|b| *b == b'\\')
+                        {
+                            write!(w, "\\")?;
+                            bytes_to_skip = another_backslash;
+                            escape_bytes_fmt(&mut w, &escape_sequence[0..another_backslash])?;
+                        } else {
+                            if bytes.len() < 3 {
+                                // Incomplete escape sequence (and no backslashes), we'll just
+                                // escape them as normal.
+                                write!(w, "\\")?;
+                                escape_bytes_fmt(&mut w, &*bytes)?;
+                                bytes_to_skip = bytes.len()
+                            } else {
+                                bytes_to_skip = 3;
+                                let ch1 = bytes[0];
+                                let ch2 = bytes[1];
+                                let ch3 = bytes[2];
+
+                                let escaped_byte_val = if ch1 == b'x' {
+                                    Self::parse_hex_escape(ch2, ch3).ok()
+                                } else {
+                                    Self::parse_decimal_escape(ch1, ch2, ch3).ok()
+                                };
+
+                                if let Some(escaped_byte_val) = escaped_byte_val {
+                                    escape_bytes_fmt(&mut w, &[escaped_byte_val])?;
+                                } else {
+                                    // Invalid escape, no backslashes; we'll just write it as
+                                    // is and move on.
+                                    write!(w, "\\")?;
+                                    escape_bytes_fmt(&mut w, &bytes[..3])?;
+                                }
+                            }
+                        }
+                    } else if bytes[0] == b'\n'
+                        || (bytes[0] == b'\r' && bytes.len() > 2 && bytes[1] == b'\n')
+                    {
+                        // If there's an escaped newline, we'll just strip it out like we do
+                        // when normally unescaping.
+                        if bytes[0] == b'\r' {
+                            bytes_to_skip += 1;
+                        }
+
+                        while bytes_to_skip < bytes.len()
+                            && (bytes[bytes_to_skip] == b' ' || bytes[bytes_to_skip] == b'\t')
+                        {
+                            bytes_to_skip += 1;
+                        }
+                    } else {
+                        // Normally this interpreted as a literal backslash and then the next
+                        // character. So we want to explicitly escape the backslash, then
+                        // escape the next byte.
+                        write!(w, "\\\\")?;
+                        escape_bytes_fmt(&mut w, &[bytes[0]])?;
+                    }
+                }
+            }
+
+            bytes = &bytes[bytes_to_skip..];
+            next_backslash = bytes.iter().position(|b| *b == b'\\');
+        }
+
+        escape_bytes_fmt(&mut w, bytes)?;
+
+        write!(w, "\"")
+    }
 }
 
-macro_rules! escape_str {
-    ($escape_str_fn:ident, $write_trait:path, $write_result:ty) => {
-        fn $escape_str_fn<W: $write_trait>(mut w: W, s: &str) -> $write_result {
-            for ch in s.chars() {
-                if ch.is_ascii() {
-                    match ch {
-                        '"' => write!(w, "\\\"")?,
-                        '\\' => write!(w, "\\\\")?,
-                        '\n' => write!(w, "\\n")?,
-                        '\r' => write!(w, "\\r")?,
-                        '\t' => write!(w, "\\t")?,
-                        '\x08' => write!(w, "\\b")?,
-                        // Control characters and DEL
-                        '\x00'..='\x1f' | '\x7f' => {
-                            escape_hex_byte!(w, ch as u32 as u8)?;
+macro_rules! escape_bytes {
+    ($escape_bytes_fn:ident, $write_trait:path, $write_result:ty) => {
+        fn $escape_bytes_fn<W: $write_trait>(mut w: W, bytes: &[u8]) -> $write_result {
+            for chunk in bytes.utf8_chunks() {
+                // Escape UTF-8 part
+                for ch in chunk.valid().chars() {
+                    if ch.is_ascii() {
+                        match ch {
+                            '"' => write!(w, "\\\"")?,
+                            '\\' => write!(w, "\\\\")?,
+                            '\n' => write!(w, "\\n")?,
+                            '\r' => write!(w, "\\r")?,
+                            '\t' => write!(w, "\\t")?,
+                            '\x08' => write!(w, "\\b")?,
+                            // Control characters and DEL
+                            '\x00'..='\x1f' | '\x7f' => {
+                                escape_hex_byte!(w, ch as u32 as u8)?;
+                            }
+                            _ => write!(w, "{}", ch)?,
                         }
-                        _ => write!(w, "{}", ch)?,
-                    }
-                } else {
-                    if is_debug_printable_non_ascii_char(ch) {
-                        write!(w, "{}", ch)?;
                     } else {
-                        let mut utf8_bytes = [0; 4];
-                        for b in ch.encode_utf8(&mut utf8_bytes).as_bytes() {
-                            escape_hex_byte!(&mut w, *b)?;
+                        if is_debug_printable_non_ascii_char(ch) {
+                            write!(w, "{}", ch)?;
+                        } else {
+                            let mut utf8_bytes = [0; 4];
+                            for b in ch.encode_utf8(&mut utf8_bytes).as_bytes() {
+                                escape_hex_byte!(&mut w, *b)?;
+                            }
                         }
                     }
+                }
+
+                // Hex escape any invalid UTF-8
+                for b in chunk.invalid().iter() {
+                    escape_hex_byte!(w, b)?;
                 }
             }
 
@@ -394,8 +512,8 @@ macro_rules! escape_str {
     };
 }
 
-escape_str!(escape_str_io, io::Write, io::Result<()>);
-escape_str!(escape_str_fmt, fmt::Write, fmt::Result);
+escape_bytes!(escape_bytes_io, io::Write, io::Result<()>);
+escape_bytes!(escape_bytes_fmt, fmt::Write, fmt::Result);
 
 fn is_debug_printable_non_ascii_char(ch: char) -> bool {
     ch.escape_debug().count() == 1
@@ -440,6 +558,14 @@ mod tests {
         atom.serialize_fmt(&mut str_buf).unwrap();
 
         assert_eq!(byte_buf.as_slice(), str_buf.as_bytes());
+
+        let mut normalized_buf = String::new();
+        PlausibleSerializedAtom::new(str_buf.as_bytes())
+            .unwrap()
+            .normalize_serialization_even_if_invalid(&mut normalized_buf)
+            .unwrap();
+
+        assert_eq!(str_buf, normalized_buf);
 
         str_buf
     }
@@ -583,5 +709,49 @@ mod tests {
     fn test_unescape_atom_assumes_validation_from_raw_tokenizer() {
         // If not quoted, might have spaces
         assert_snapshot!(u(b" "), @r#"> " " (no unescaping)"#);
+    }
+
+    #[test]
+    fn test_normalize_serialization() {
+        fn n(unnormalized_bytes: &[u8]) -> String {
+            let unnormalized_atom = PlausibleSerializedAtom::new(unnormalized_bytes).unwrap();
+            let mut s = String::new();
+            unnormalized_atom
+                .normalize_serialization_even_if_invalid(&mut s)
+                .unwrap();
+            s
+        }
+
+        assert_eq!(n(br#""""#), r#""""#);
+        assert_eq!(n(br#""\\\""#), r#""\\\""#);
+
+        // Unnecessary escapes:
+        assert_eq!(n(br#""a\ b\'c""#), "\"a b'c\"");
+        assert_eq!(n(br#""\n\t\b\r""#), "\"\\n\\t\\b\\r\"");
+        assert_eq!(n(br#""a\x20b\032c""#), "\"a b c\"");
+
+        // Invalid hex escape:
+        assert_eq!(n(br#""\x""#), "\"\\x\"");
+        assert_eq!(n(br#""\xa""#), "\"\\xa\"");
+        assert_eq!(n(b"\"\\x\xa0\""), "\"\\x\\xa0\"");
+        assert_eq!(n(b"\"\\xf\xa0\""), "\"\\xf\\xa0\"");
+        assert_eq!(n(br#""\xfg""#), "\"\\xfg\"");
+
+        // Process the \x20 escape as a space.
+        assert_eq!(n(br#""\xf\x20""#), "\"\\xf \"");
+
+        // Invalid decimal escape:
+        assert_eq!(n(br#""\9""#), "\"\\9\"");
+        assert_eq!(n(br#""\8a""#), "\"\\8a\"");
+        assert_eq!(n(b"\"\\7\xa0\""), "\"\\7\\xa0\"");
+        assert_eq!(n(b"\"\\76\xa0\""), "\"\\76\\xa0\"");
+        assert_eq!(n(br#""\256""#), "\"\\256\"");
+
+        // Escaped newlines removed:
+        assert_eq!(n(b"\"\\x a\\\n \tb\""), "\"\\x ab\"");
+        assert_eq!(n(b"\"\\x a\\\r\n \t  b\""), "\"\\x ab\"");
+
+        // Backslash non-escapes get made explicit:
+        assert_eq!(n(b"\"\\a\\\xa0\""), r#""\\a\\\xa0""#);
     }
 }

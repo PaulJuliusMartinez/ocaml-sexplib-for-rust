@@ -5,6 +5,7 @@ main
 - Rename `InputRef` to `Ref` and move it to a top-level crate item
 - Remove `RawBytes` and `UnescapedBytes` and move all unescaping logic to `atom` module
 - Add function to serialize `AtomData` to a `fmt::Write`
+- Add `PlausiblySerializedAtom::normalize_serialization_even_if_invalid`
 
 v0.0.3 (2025-12-13)
 ===
