@@ -1,5 +1,5 @@
-main
-===
+v0.0.4 (2026-04-26)
+===================
 - Make `atom` and `token_writer` modules public
 - Rework `atom` module to expose separate types for atom data vs serialized atom data
 - Rename `InputRef` to `Ref` and move it to a top-level crate item
@@ -8,11 +8,11 @@ main
 - Add `PlausiblySerializedAtom::normalize_serialization_even_if_invalid`
 
 v0.0.3 (2025-12-13)
-===
+===================
 - Actually escape atoms during serialization
 
 v0.0.2 (2025-11-22)
-====
+===================
 - Rework low-level API to expose `RawTokenTape` trait
 - Remove unused `CallNextRawTokenToGetTheRealError`
 
