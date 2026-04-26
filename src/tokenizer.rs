@@ -1,14 +1,15 @@
 use std::collections::VecDeque;
-use std::ops::{Deref, Range};
+use std::ops::Range;
 
-use crate::error::Result;
+use crate::atom::{AtomData, PlausibleSerializedAtom};
+use crate::error::{Result, TokenizationError};
 use crate::input::{Input, InputChunk};
 use crate::Ref;
 
 #[derive(Debug)]
 pub enum Token<'de, 't> {
     LeftParen,
-    Atom(Ref<'de, 't, UnescapedBytes>),
+    Atom(Ref<'de, 't, AtomData>),
     RightParen,
 }
 
@@ -42,11 +43,6 @@ pub enum VarTokenKind {
     BlockComment,
 }
 
-pub enum UnescapeResult<'b, 't> {
-    NoUnescapingNeeded(&'b UnescapedBytes),
-    Escaped(&'t UnescapedBytes),
-}
-
 /// Raw bytes that have already designated by the tokenizer as representing an input
 /// token, and thus already have certain guarantees. Will not be empty.
 ///
@@ -58,238 +54,22 @@ pub enum UnescapeResult<'b, 't> {
 ///
 /// Block comments: Starts with "#|" and ends with "|#". Double quotes will be balanced
 /// and may contain escaped values in between.
-///
-/// Valid escape sequences include:
-/// - Literal character escapes \ (backslash), ' (single quote), " (double quote)
-/// - Control character escapes n (newline), t (tab), b (backspace), r (carriage return)
-/// - Decimal escapes: \ddd, where ddd when interpreted in decimal, represents a raw
-///   byte value
-/// - Hexadecimal escape: \xhh, where hh, when interpreted in hexadecimal, represents a
-///   raw byte value
-/// - Line wrapping escape: \ [newline or CRLF] [spaces or tabs]; these bytes are totally
-///   ignored and used to wrap long atoms on multiple lines
-/// - Backslashes followed by any other character is interpreted as a literal backslash
-///   and then that character
 #[derive(Debug)]
 #[repr(transparent)]
-pub struct RawBytes([u8]);
+pub struct RawTokenBytes([u8]);
 
-impl RawBytes {
-    fn new(bytes: &[u8]) -> &RawBytes {
-        // SAFETY: RawBytes is just a wrapper around [u8], enforced by #[repr(transparent)],
-        // therefore converting &[u8] to &RawBytes is safe.
-        unsafe { &*(bytes as *const [u8] as *const RawBytes) }
+impl RawTokenBytes {
+    pub fn new(bytes: &[u8]) -> &RawTokenBytes {
+        // SAFETY: RawTokenBytes is just a wrapper around [u8], enforced by #[repr(transparent)],
+        // therefore converting &[u8] to &RawTokenBytes is safe.
+        unsafe { &*(bytes as *const [u8] as *const RawTokenBytes) }
     }
 
-    pub fn raw_bytes(&self) -> &[u8] {
+    pub fn bytes(&self) -> &[u8] {
         &self.0
     }
 
-    fn parse_hex_escape(b1: u8, b2: u8) -> std::result::Result<u8, Error> {
-        fn of_hexdigit(b: u8) -> Option<u32> {
-            if b.is_ascii() {
-                (b as char).to_digit(16)
-            } else {
-                None
-            }
-        }
-
-        let h1 = of_hexdigit(b1);
-        let h2 = of_hexdigit(b2);
-
-        let (Some(h1), Some(h2)) = (h1, h2) else {
-            return Err(Error::InvalidHexadecimalEscape);
-        };
-
-        Ok((h1 * 16 + h2) as u8)
-    }
-
-    fn parse_decimal_escape(b1: u8, b2: u8, b3: u8) -> std::result::Result<u8, Error> {
-        fn of_digit(b: u8) -> Option<u32> {
-            if b.is_ascii_digit() {
-                Some((b - b'0') as u32)
-            } else {
-                None
-            }
-        }
-
-        let d1 = of_digit(b1);
-        let d2 = of_digit(b2);
-        let d3 = of_digit(b3);
-
-        let (Some(d1), Some(d2), Some(d3)) = (d1, d2, d3) else {
-            return Err(Error::InvalidDecimalEscape);
-        };
-
-        let b = d1 * 100 + d2 * 10 + d3;
-        if b > 255 {
-            return Err(Error::OutOfRangeDecimalEscape);
-        }
-
-        Ok(b as u8)
-    }
-
-    /// Unescapes the raw bytes in atoms.
-    pub fn unescape_atom<'b, 't>(
-        &'b self,
-        scratch: &'t mut Vec<u8>,
-    ) -> std::result::Result<UnescapeResult<'b, 't>, Error> {
-        let bytes = &self.0;
-
-        if bytes.len() == 0 {
-            return Err(Error::EmptyRawBytes);
-        }
-
-        if bytes[0] != b'"' {
-            return Ok(UnescapeResult::NoUnescapingNeeded(UnescapedBytes::new(
-                bytes,
-            )));
-        }
-
-        if bytes[bytes.len() - 1] != b'"' {
-            return Err(Error::UnterminatedQuote);
-        }
-
-        // Trim quotes
-        let mut bytes = &bytes[1..(bytes.len() - 1)];
-
-        // Someday: Use memchr
-        let mut next_backslash = bytes.iter().position(|b| *b == b'\\');
-        if next_backslash.is_none() {
-            return Ok(UnescapeResult::NoUnescapingNeeded(UnescapedBytes::new(
-                bytes,
-            )));
-        }
-
-        scratch.clear();
-
-        while let Some(backslash_index) = next_backslash {
-            scratch.extend_from_slice(&bytes[..backslash_index]);
-            bytes = &bytes[backslash_index..];
-
-            if bytes.len() < 2 {
-                return Err(Error::UnterminatedBackslashEscape);
-            }
-
-            let mut bytes_to_skip = 2;
-            let escaped_byte = bytes[1];
-            match bytes[1] {
-                b'\\' | b'\'' | b'"' | b' ' => scratch.push(escaped_byte),
-                b'n' => scratch.push(b'\n'),
-                b't' => scratch.push(b'\t'),
-                b'b' => scratch.push(b'\x08'),
-                b'r' => scratch.push(b'\r'),
-                b'x' => {
-                    if bytes.len() < 4 {
-                        return Err(Error::UnterminatedHexadecimalEscape);
-                    }
-
-                    bytes_to_skip = 4;
-                    let hex_value = Self::parse_hex_escape(bytes[2], bytes[3])?;
-                    scratch.push(hex_value);
-                }
-                _ if escaped_byte.is_ascii_digit() => {
-                    if bytes.len() < 4 {
-                        return Err(Error::UnterminatedDecimalEscape);
-                    }
-
-                    bytes_to_skip = 4;
-                    let decimal_value = Self::parse_decimal_escape(bytes[1], bytes[2], bytes[3])?;
-                    scratch.push(decimal_value);
-                }
-                _ => {
-                    if escaped_byte == b'\n'
-                        || (escaped_byte == b'\r' && bytes.len() >= 3 && bytes[2] == b'\n')
-                    {
-                        if escaped_byte == b'\r' {
-                            bytes_to_skip += 1;
-                        }
-
-                        while bytes_to_skip < bytes.len()
-                            && (bytes[bytes_to_skip] == b' ' || bytes[bytes_to_skip] == b'\t')
-                        {
-                            bytes_to_skip += 1;
-                        }
-                    } else {
-                        // Technically in this case we aren't actually unescaping anything,
-                        // so we could return `NoUnescapingNeeded` if this was the only
-                        // case we hit.
-                        scratch.push(b'\\');
-                        scratch.push(escaped_byte);
-                    }
-                }
-            }
-
-            bytes = &bytes[bytes_to_skip..];
-            next_backslash = bytes.iter().position(|b| *b == b'\\');
-        }
-
-        scratch.extend_from_slice(bytes);
-
-        Ok(UnescapeResult::Escaped(UnescapedBytes::new(
-            scratch.as_slice(),
-        )))
-    }
-
-    /// Validates that a quoted section contains valid escaping.
-    fn validate_quote_escaping(mut bytes: &[u8]) -> std::result::Result<(), Error> {
-        while let Some(backslash_index) = bytes.iter().position(|b| *b == b'\\') {
-            bytes = &bytes[backslash_index..];
-
-            let mut bytes_to_skip = 2;
-            if bytes.len() < 2 {
-                return Err(Error::UnterminatedBackslashEscape);
-            }
-
-            let escaped_byte = bytes[1];
-            match bytes[1] {
-                b'\\' | b'\'' | b'"' | b' ' => (), // Literal character escape
-                b'n' | b't' | b'b' | b'r' => (),   // Control character escape
-                b'x' => {
-                    if bytes.len() < 4 {
-                        return Err(Error::UnterminatedHexadecimalEscape);
-                    }
-
-                    bytes_to_skip = 4;
-                    let _ = Self::parse_hex_escape(bytes[2], bytes[3])?;
-                }
-                _ if escaped_byte.is_ascii_digit() => {
-                    if bytes.len() < 4 {
-                        return Err(Error::UnterminatedDecimalEscape);
-                    }
-
-                    bytes_to_skip = 4;
-                    let _ = Self::parse_decimal_escape(bytes[1], bytes[2], bytes[3])?;
-                }
-                _ => (), // Newline / CRLF escapes, and non-escapes
-            }
-
-            bytes = &bytes[bytes_to_skip..];
-        }
-
-        Ok(())
-    }
-
-    /// Validate that an atom is valid.
-    pub fn validate_atom(&self) -> std::result::Result<(), Error> {
-        let bytes = &self.0;
-
-        if bytes.len() == 0 {
-            return Err(Error::EmptyRawBytes);
-        }
-
-        if bytes[0] != b'"' {
-            return Ok(());
-        }
-
-        if bytes[bytes.len() - 1] != b'"' {
-            return Err(Error::UnterminatedQuote);
-        }
-
-        Self::validate_quote_escaping(&bytes[1..(bytes.len() - 1)])
-    }
-
-    pub fn validate_block_comment(&self) -> std::result::Result<(), Error> {
+    pub fn validate_block_comment(&self) -> std::result::Result<(), TokenizationError> {
         let mut bytes = &self.0;
 
         // Someday: Use memchr
@@ -305,7 +85,7 @@ impl RawBytes {
                     .iter()
                     .position(|b| *b == b'"' || *b == b'\\')
                 else {
-                    return Err(Error::UnterminatedQuote);
+                    return Err(TokenizationError::UnterminatedQuote);
                 };
 
                 close_quote_index += quote_or_backslash_index;
@@ -315,7 +95,7 @@ impl RawBytes {
                 }
 
                 if quote_or_backslash_index + 1 >= remaining_bytes.len() {
-                    return Err(Error::UnterminatedBackslashEscape);
+                    return Err(TokenizationError::UnterminatedBackslashEscape);
                 }
 
                 // Skip past the escaped character (we'll validate the actual escape below).
@@ -323,7 +103,8 @@ impl RawBytes {
                 remaining_bytes = &remaining_bytes[(quote_or_backslash_index + 2)..];
             }
 
-            Self::validate_quote_escaping(dbg!(&bytes[..close_quote_index]))?;
+            // Quoted sections in block comments must follow the same rules as regular atoms.
+            PlausibleSerializedAtom::validate_quote_escaping(&bytes[..close_quote_index])?;
 
             bytes = &bytes[(close_quote_index + 1)..];
         }
@@ -333,32 +114,12 @@ impl RawBytes {
 }
 
 #[derive(Debug)]
-#[repr(transparent)]
-pub struct UnescapedBytes(pub [u8]);
-
-impl UnescapedBytes {
-    pub fn new(bytes: &[u8]) -> &UnescapedBytes {
-        // SAFETY: UnescapedBytes is just a wrapper around [u8], enforced by #[repr(transparent)],
-        // therefore converting &[u8] to &UnescapedBytes is safe.
-        unsafe { &*(bytes as *const [u8] as *const UnescapedBytes) }
-    }
-}
-
-impl Deref for UnescapedBytes {
-    type Target = [u8];
-
-    fn deref(&self) -> &Self::Target {
-        &self.0
-    }
-}
-
-#[derive(Debug)]
 pub enum RawToken<'de, 't> {
     LeftParen,
     RightParen,
-    Atom(Ref<'de, 't, RawBytes>),
-    LineComment(Ref<'de, 't, RawBytes>),
-    BlockComment(Ref<'de, 't, RawBytes>),
+    Atom(Ref<'de, 't, PlausibleSerializedAtom>),
+    LineComment(Ref<'de, 't, RawTokenBytes>),
+    BlockComment(Ref<'de, 't, RawTokenBytes>),
     SexpComment,
 }
 
@@ -377,15 +138,26 @@ impl<'de, 't> RawToken<'de, 't> {
         token_bytes: Ref<'de, 't, [u8]>,
         kind: VarTokenKind,
     ) -> RawToken<'de, 't> {
-        let raw_bytes = match token_bytes {
-            Ref::Borrowed(bytes) => Ref::Borrowed(RawBytes::new(bytes)),
-            Ref::Transient(bytes) => Ref::Transient(RawBytes::new(bytes)),
+        if matches!(kind, VarTokenKind::Atom) {
+            let plausible_atom = match token_bytes {
+                Ref::Borrowed(bytes) => Ref::Borrowed(PlausibleSerializedAtom::new(bytes).unwrap()),
+                Ref::Transient(bytes) => {
+                    Ref::Transient(PlausibleSerializedAtom::new(bytes).unwrap())
+                }
+            };
+
+            return RawToken::Atom(plausible_atom);
+        }
+
+        let raw_token_bytes = match token_bytes {
+            Ref::Borrowed(bytes) => Ref::Borrowed(RawTokenBytes::new(bytes)),
+            Ref::Transient(bytes) => Ref::Transient(RawTokenBytes::new(bytes)),
         };
 
         match kind {
-            VarTokenKind::Atom => RawToken::Atom(raw_bytes),
-            VarTokenKind::LineComment => RawToken::LineComment(raw_bytes),
-            VarTokenKind::BlockComment => RawToken::BlockComment(raw_bytes),
+            VarTokenKind::LineComment => RawToken::LineComment(raw_token_bytes),
+            VarTokenKind::BlockComment => RawToken::BlockComment(raw_token_bytes),
+            VarTokenKind::Atom => unreachable!(),
         }
     }
 }
@@ -512,29 +284,6 @@ pub struct BasicTapeTokenizer {
     start_of_current_token: usize,
 }
 
-#[derive(Clone, Debug, PartialEq, Eq)]
-pub enum Error {
-    NakedCarriageReturn,
-    BlockCommentStartTokenInUnquotedAtom,
-    BlockCommentEndTokenInUnquotedAtom,
-    UnexpectedEndOfBlockComment,
-    UnexpectedEofWhileInInQuotedAtom,
-    UnexpectedEofWhileInBlockComment,
-    TriedToProcessMoreDataAfterEof,
-    EofCalledMultipleTimes,
-    UnterminatedSexpCommentAtEof,
-    UnterminatedSexpCommentAtEndOfList,
-    // Called when validating and/or unsecaping raw bytes
-    EmptyRawBytes,
-    UnterminatedBackslashEscape,
-    UnterminatedHexadecimalEscape,
-    UnterminatedDecimalEscape,
-    InvalidHexadecimalEscape,
-    InvalidDecimalEscape,
-    OutOfRangeDecimalEscape,
-    UnterminatedQuote,
-}
-
 macro_rules! whitespace {
     () => {
         b' ' | b'\n' | b'\t' | b'\x0c'
@@ -597,6 +346,12 @@ impl BasicTapeTokenizer {
             &mut self.scratch_buffer_for_current_token,
         );
         self.scratch_buffer_for_current_token.clear();
+    }
+}
+
+impl Default for BasicTapeTokenizer {
+    fn default() -> Self {
+        Self::new()
     }
 }
 
@@ -668,7 +423,7 @@ impl RawTokenTape for BasicTapeTokenizer {
 
         if self.state.is_none() {
             self.raw_token_refs
-                .push_back(Err(Error::TriedToProcessMoreDataAfterEof.into()));
+                .push_back(Err(TokenizationError::TriedToProcessMoreDataAfterEof.into()));
             return;
         };
 
@@ -691,7 +446,7 @@ impl RawTokenTape for BasicTapeTokenizer {
                 TokenizationState::CarriageReturn => {
                     if *ch != b'\n' {
                         self.raw_token_refs
-                            .push_back(Err(Error::NakedCarriageReturn.into()));
+                            .push_back(Err(TokenizationError::NakedCarriageReturn.into()));
                         // Someday: Make `state` be `Eof`, `Error` or `Some`.
                         self.state = None;
                         return;
@@ -737,14 +492,16 @@ impl RawTokenTape for BasicTapeTokenizer {
                     },
                     b'#' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomBar => {
-                            self.raw_token_refs
-                                .push_back(Err(Error::BlockCommentEndTokenInUnquotedAtom.into()));
+                            self.raw_token_refs.push_back(Err(
+                                TokenizationError::BlockCommentEndTokenInUnquotedAtom.into(),
+                            ));
                             self.state = None;
                             return;
                         }
                         TokenizationState::Bar => {
-                            self.raw_token_refs
-                                .push_back(Err(Error::UnexpectedEndOfBlockComment.into()));
+                            self.raw_token_refs.push_back(Err(
+                                TokenizationError::UnexpectedEndOfBlockComment.into(),
+                            ));
                             self.state = None;
                             return;
                         }
@@ -752,8 +509,9 @@ impl RawTokenTape for BasicTapeTokenizer {
                     },
                     b'|' => match self.state.unwrap() {
                         TokenizationState::InUnquotedAtomPoundSign => {
-                            self.raw_token_refs
-                                .push_back(Err(Error::BlockCommentStartTokenInUnquotedAtom.into()));
+                            self.raw_token_refs.push_back(Err(
+                                TokenizationError::BlockCommentStartTokenInUnquotedAtom.into(),
+                            ));
                             self.state = None;
                             return;
                         }
@@ -866,7 +624,7 @@ impl RawTokenTape for BasicTapeTokenizer {
         // Set `self.state` to `None`, indicating that we've seen EOF.
         let Some(final_state) = self.state.take() else {
             self.raw_token_refs
-                .push_back(Err(Error::EofCalledMultipleTimes.into()));
+                .push_back(Err(TokenizationError::EofCalledMultipleTimes.into()));
             return;
         };
 
@@ -903,16 +661,16 @@ impl RawTokenTape for BasicTapeTokenizer {
                     VarTokenKind::Atom,
                 ))
             }
-            TokenizationState::CarriageReturn => Err(Error::NakedCarriageReturn.into()),
+            TokenizationState::CarriageReturn => Err(TokenizationError::NakedCarriageReturn.into()),
             TokenizationState::InQuotedAtom | TokenizationState::InQuotedAtomEscape => {
-                Err(Error::UnexpectedEofWhileInInQuotedAtom.into())
+                Err(TokenizationError::UnexpectedEofWhileInInQuotedAtom.into())
             }
             TokenizationState::BlockComment
             | TokenizationState::BlockCommentPoundSign
             | TokenizationState::BlockCommentBar
             | TokenizationState::BlockCommentInQuotedString
             | TokenizationState::BlockCommentInQuotedStringEscape => {
-                Err(Error::UnexpectedEofWhileInBlockComment.into())
+                Err(TokenizationError::UnexpectedEofWhileInBlockComment.into())
             }
         };
 
@@ -996,14 +754,14 @@ where
 
         while !self.sexp_comment_nesting_depths.is_empty() {
             match self.raw_tokenizer.next_raw_token()? {
-                None => return Err(Error::UnterminatedSexpCommentAtEof.into()),
+                None => return Err(TokenizationError::UnterminatedSexpCommentAtEof.into()),
                 Some(RawToken::LeftParen) => {
                     *self.sexp_comment_nesting_depths.last_mut().unwrap() += 1
                 }
                 Some(RawToken::RightParen) => {
                     let last = self.sexp_comment_nesting_depths.last_mut().unwrap();
                     if *last == 0 {
-                        return Err(Error::UnterminatedSexpCommentAtEndOfList.into());
+                        return Err(TokenizationError::UnterminatedSexpCommentAtEndOfList.into());
                     }
 
                     *last -= 1;
@@ -1012,7 +770,7 @@ where
                     }
                 }
                 Some(RawToken::Atom(atom)) => {
-                    atom.validate_atom()?;
+                    atom.validate()?;
                     if *self.sexp_comment_nesting_depths.last().unwrap() == 0 {
                         self.sexp_comment_nesting_depths.pop();
                     }
@@ -1119,22 +877,31 @@ where
                     return Ok(Some(Token::RightParen));
                 }
                 RawTokenKind::Atom => {
-                    let Ok(Some(RawToken::Atom(atom_bytes))) = self.raw_tokenizer.next_raw_token()
+                    let Ok(Some(RawToken::Atom(serialized_atom))) =
+                        self.raw_tokenizer.next_raw_token()
                     else {
                         panic!("peek_raw_token_kind just returned Atom");
                     };
 
-                    let atom = match atom_bytes {
-                        Ref::Borrowed(bytes) => {
-                            match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
-                                UnescapeResult::NoUnescapingNeeded(atom) => Ref::Borrowed(atom),
-                                UnescapeResult::Escaped(atom) => Ref::Transient(atom),
+                    let atom = match serialized_atom {
+                        Ref::Borrowed(serialized_atom) => {
+                            match serialized_atom
+                                .unescape(&mut self.scratch_space_for_unescaped_atom)?
+                            {
+                                Ref::Borrowed(atom) => Ref::Borrowed(atom),
+                                Ref::Transient(atom) => Ref::Transient(atom),
                             }
                         }
-                        Ref::Transient(bytes) => {
-                            match bytes.unescape_atom(&mut self.scratch_space_for_unescaped_atom)? {
-                                UnescapeResult::NoUnescapingNeeded(atom)
-                                | UnescapeResult::Escaped(atom) => Ref::Transient(atom),
+                        Ref::Transient(serialized_atom) => {
+                            match serialized_atom
+                                .unescape(&mut self.scratch_space_for_unescaped_atom)?
+                            {
+                                Ref::Borrowed(atom) | Ref::Transient(atom) => {
+                                    // Even if got back a Ref::Borrowed because we didn't have to
+                                    // do any unescaping, it's coming from a Transient ref, so we
+                                    // always have to return Trasient.
+                                    Ref::Transient(atom)
+                                }
                             }
                         }
                     };
@@ -1163,6 +930,7 @@ where
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::atom::AtomData;
     use crate::error;
     use crate::input::tests::ExplicitChunksInput;
     use crate::input::SliceInput;
@@ -1214,7 +982,7 @@ mod tests {
     }
 
     fn format_raw_token(raw_token: RawToken<'_, '_>) -> String {
-        fn borrowed_or_owned(token_bytes: &Ref<'_, '_, RawBytes>) -> &'static str {
+        fn borrowed_or_owned<T: ?Sized>(token_bytes: &Ref<'_, '_, T>) -> &'static str {
             match token_bytes {
                 Ref::Borrowed(_) => "borrowed",
                 Ref::Transient(_) => "transient",
@@ -1225,19 +993,19 @@ mod tests {
             RawToken::LeftParen => "LeftParen: (".to_owned(),
             RawToken::RightParen => "RightParen: )".to_owned(),
             RawToken::SexpComment => "SexpComment: #;".to_owned(),
-            RawToken::Atom(raw_bytes) => {
-                let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.raw_bytes().as_bstr();
+            RawToken::Atom(raw_token_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_token_bytes);
+                let bytes = raw_token_bytes.bytes().as_bstr();
                 format!("Atom: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::LineComment(raw_bytes) => {
-                let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.raw_bytes().as_bstr();
+            RawToken::LineComment(raw_token_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_token_bytes);
+                let bytes = raw_token_bytes.bytes().as_bstr();
                 format!("LineComment: {:?} ({})", bytes, ref_kind)
             }
-            RawToken::BlockComment(raw_bytes) => {
-                let ref_kind = borrowed_or_owned(&raw_bytes);
-                let bytes = raw_bytes.raw_bytes().as_bstr();
+            RawToken::BlockComment(raw_token_bytes) => {
+                let ref_kind = borrowed_or_owned(&raw_token_bytes);
+                let bytes = raw_token_bytes.bytes().as_bstr();
                 format!("BlockComment: {:?} ({})", bytes, ref_kind)
             }
         }
@@ -1487,103 +1255,10 @@ mod tests {
         );
     }
 
-    fn u(bytes: &[u8]) -> String {
-        let unescaped = RawBytes::new(bytes);
-        let mut scratch = vec![];
-
-        match (
-            unescaped.unescape_atom(&mut scratch),
-            unescaped.validate_atom(),
-        ) {
-            (Ok(UnescapeResult::NoUnescapingNeeded(bytes)), Ok(())) => {
-                format!("> {:?} (no unescaping)", bytes.as_bstr())
-            }
-            (Ok(UnescapeResult::Escaped(bytes)), Ok(())) => {
-                format!("> {:?} (escaped)", bytes.as_bstr())
-            }
-            (Err(unescape_err), Err(validation_err)) => {
-                if unescape_err == validation_err {
-                    format!("> ERROR: {:?}", unescape_err)
-                } else {
-                    panic!(
-                        "RawBytes::unescape_atom and RawBytes::validate_atom returned different errors.\n  unescape error: {:?}\n  validation error: {:?}\n  raw bytes: {:?}",
-                        unescape_err,
-                        validation_err,
-                        bytes.as_bstr(),
-                    );
-                }
-            }
-            (Ok(_), Err(validation_err)) => {
-                panic!(
-                    "RawBytes::unescape_atom returned valid data, but RawBytes::validate_atom returned an error.\n  validation error: {:?}\n  raw bytes: {:?}",
-                    validation_err,
-                    bytes.as_bstr(),
-                );
-            }
-            (Err(unescape_err), Ok(())) => {
-                panic!(
-                    "RawBytes::unescape_atom returned an error, but RawBytes::validate_atom returned Ok.\n  unescape error: {:?}\n  raw bytes: {:?}",
-                    unescape_err,
-                    bytes.as_bstr(),
-                );
-            }
-        }
-    }
-
-    #[test]
-    fn test_unescaping_atoms_basic() {
-        assert_snapshot!(u(b""),                     @"> ERROR: EmptyRawBytes");
-        assert_snapshot!(u(b"a"),                  @r#"> "a" (no unescaping)"#);
-        assert_snapshot!(u(br#""""#),              @r#"> "" (no unescaping)"#);
-        assert_snapshot!(u(br#""abc"#),              @"> ERROR: UnterminatedQuote");
-        assert_snapshot!(u(br#""\"""#),            @r#"> "\"" (escaped)"#);
-        assert_snapshot!(u(br#""a\\ \' \" \ z""#), @r#"> "a\\ \' \"  z" (escaped)"#);
-        assert_snapshot!(u(br#""\n \t \b \r""#),   @r#"> "\n \t \x08 \r" (escaped)"#);
-        assert_snapshot!(u(b"\"\\\""),              @"> ERROR: UnterminatedBackslashEscape");
-    }
-
-    #[test]
-    fn test_unescaping_atoms_decimal_escapes() {
-        assert_snapshot!(u(br#""\000 \255""#), @r#"> "\0 \xff" (escaped)"#);
-        assert_snapshot!(u(br#""a \256""#),      @"> ERROR: OutOfRangeDecimalEscape");
-        assert_snapshot!(u(br#""a \999""#),      @"> ERROR: OutOfRangeDecimalEscape");
-        assert_snapshot!(u(br#""a \99""#),       @"> ERROR: UnterminatedDecimalEscape");
-    }
-
-    #[test]
-    fn test_unescaping_atoms_hexadecimal_escapes() {
-        assert_snapshot!(u(br#""\x00 \xab \xFF""#), @r#"> "\0 \xab \xff" (escaped)"#);
-        assert_snapshot!(u(br#""\x0""#),              @"> ERROR: UnterminatedHexadecimalEscape");
-        assert_snapshot!(u(br#""\xgg""#),             @"> ERROR: InvalidHexadecimalEscape");
-    }
-
-    #[test]
-    fn test_unescaping_atoms_newline_escapes() {
-        // Spaces after escape newline or CRLF (but not raw `\r`) are removed.
-        assert_snapshot!(u(b"\"abc\\\n   z\""),   @r#"> "abcz" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\\\r\n   z\""), @r#"> "abcz" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\r   z\""),     @r#"> "abc\r   z" (no unescaping)"#);
-        assert_snapshot!(u(b"\"abc\\\r   z\""),   @r#"> "abc\\\r   z" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\\\rd  z\""),   @r#"> "abc\\\rd  z" (escaped)"#);
-        assert_snapshot!(u(b"\"abc\\\r\""),       @r#"> "abc\\\r" (escaped)"#);
-    }
-
-    #[test]
-    fn test_unescape_atom_non_escapes_still_use_scratch_space() {
-        // We could return the original data here, but this case is probably rare.
-        assert_snapshot!(u(b"\"\\a\""), @r#"> "\\a" (escaped)"#);
-    }
-
-    #[test]
-    fn test_unescape_atom_assumes_validation_from_raw_tokenizer() {
-        // If not quoted, might have spaces
-        assert_snapshot!(u(b" "), @r#"> " " (no unescaping)"#);
-    }
-
     #[test]
     fn test_block_comment_validation() {
         fn b(bytes: &[u8]) -> String {
-            match RawBytes::new(bytes).validate_block_comment() {
+            match RawTokenBytes::new(bytes).validate_block_comment() {
                 Ok(()) => "Ok".to_owned(),
                 Err(err) => format!("{:?}", err),
             }
@@ -1618,7 +1293,7 @@ mod tests {
     }
 
     fn format_token(token: Token<'_, '_>) -> String {
-        fn borrowed_or_owned(token_bytes: &Ref<'_, '_, UnescapedBytes>) -> &'static str {
+        fn borrowed_or_owned(token_bytes: &Ref<'_, '_, AtomData>) -> &'static str {
             match token_bytes {
                 Ref::Borrowed(_) => "borrowed",
                 Ref::Transient(_) => "transient",
@@ -1628,9 +1303,9 @@ mod tests {
         match token {
             Token::LeftParen => "LeftParen: (".to_owned(),
             Token::RightParen => "RightParen: )".to_owned(),
-            Token::Atom(bytes) => {
-                let ref_kind = borrowed_or_owned(&bytes);
-                format!("Atom: {:?} ({})", bytes.as_bstr(), ref_kind)
+            Token::Atom(data) => {
+                let ref_kind = borrowed_or_owned(&data);
+                format!("Atom: {:?} ({})", data.bytes().as_bstr(), ref_kind)
             }
         }
     }

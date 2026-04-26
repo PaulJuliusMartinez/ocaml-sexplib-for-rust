@@ -7,9 +7,10 @@ use serde::de::{
 };
 use serde::Deserialize;
 
+use crate::atom::AtomData;
 use crate::error::{Error, Result};
 use crate::input::SliceInput;
-use crate::tokenizer::{Token, TokenIterator, TokenKind, Tokenizer, UnescapedBytes};
+use crate::tokenizer::{Token, TokenIterator, TokenKind, Tokenizer};
 use crate::Ref;
 
 #[derive(Debug)]
@@ -53,7 +54,7 @@ where
         let _ = self.tokens.next();
     }
 
-    fn expect_atom<'t>(&'t mut self) -> Result<Ref<'de, 't, UnescapedBytes>> {
+    fn expect_atom<'t>(&'t mut self) -> Result<Ref<'de, 't, AtomData>> {
         match self.next()? {
             None => error("expected atom; reached end of input"),
             Some(Token::LeftParen) => error("expected atom; got list"),
@@ -185,7 +186,7 @@ macro_rules! impl_deserialize_int {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(&atom) {
+            match std::str::from_utf8(atom.bytes()) {
                 Err(_) => error("expected int literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$int_t>().map_err(parse_int_error)?;
@@ -203,7 +204,7 @@ macro_rules! impl_deserialize_float {
             V: Visitor<'de>,
         {
             let atom = self.expect_atom()?;
-            match std::str::from_utf8(&atom) {
+            match std::str::from_utf8(atom.bytes()) {
                 Err(_) => error("expected float literal; got invalid UTF-8"),
                 Ok(s) => {
                     let i = s.parse::<$float_t>().map_err(parse_float_error)?;
@@ -236,9 +237,9 @@ where
     where
         V: Visitor<'de>,
     {
-        let atom: &[u8] = &self.expect_atom()?;
+        let atom = &self.expect_atom()?;
 
-        let b = match atom {
+        let b = match atom.bytes() {
             b"true" => true,
             b"false" => false,
             _ => return error("expected `true` or `false`"),
@@ -266,7 +267,7 @@ where
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        let mut chars = match std::str::from_utf8(&atom) {
+        let mut chars = match std::str::from_utf8(atom.bytes()) {
             Ok(s) => s.chars(),
             Err(_) => return error("expected valid UTF-8 for char value"),
         };
@@ -290,7 +291,7 @@ where
         // Someday: Make `Token` have a `Cow`, so this can pass a borrowed string
         // if possible.
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(&atom) {
+        match std::str::from_utf8(atom.bytes()) {
             Ok(s) => visitor.visit_string(s.to_owned()),
             Err(_) => error("atom was not valid UTF-8"),
         }
@@ -350,7 +351,7 @@ where
         V: Visitor<'de>,
     {
         let atom = self.expect_atom()?;
-        match std::str::from_utf8(&atom) {
+        match std::str::from_utf8(atom.bytes()) {
             Ok(s) => {
                 if s == name {
                     visitor.visit_unit()
@@ -438,7 +439,7 @@ where
                 let Some(Token::Atom(atom)) = self.next()? else {
                     panic!("peek_kind said next would return an atom");
                 };
-                match std::str::from_utf8(&atom) {
+                match std::str::from_utf8(atom.bytes()) {
                     Ok(s) => {
                         // `IntoDeserializer` is implemented for `&str` and returns a
                         // `StrDeserializer`, which implements a special `EnumAccess`
@@ -589,6 +590,7 @@ mod tests {
     use insta::assert_debug_snapshot;
 
     use super::*;
+    use crate::atom::AtomData;
     use crate::Ref;
 
     impl<'de> TokenIterator<'de> for Vec<Token<'de, '_>> {
@@ -610,8 +612,8 @@ mod tests {
         T::deserialize(&mut deserializer)
     }
 
-    fn a(s: &'static str) -> Token<'static, '_> {
-        Token::Atom(Ref::Borrowed(UnescapedBytes::new(s.as_bytes())))
+    fn a(s: &'static str) -> Token<'static, 'static> {
+        Token::Atom(Ref::Borrowed(AtomData::new(s.as_bytes())))
     }
 
     const LP: Token = Token::LeftParen;

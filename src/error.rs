@@ -4,8 +4,6 @@ use std::sync::Arc;
 
 use serde::{de, ser};
 
-use crate::tokenizer;
-
 pub type Result<T> = std::result::Result<T, Error>;
 
 #[derive(Clone, Debug)]
@@ -13,9 +11,32 @@ pub enum Error {
     SerializationError(String),
     DeserializationError(String),
     // Someday: Store the location of the tokenization error.
-    TokenizationError(tokenizer::Error),
+    TokenizationError(TokenizationError),
     // Arc so this can be made [Clone]
     IoError(Arc<io::Error>),
+}
+
+#[derive(Clone, Debug, PartialEq, Eq)]
+pub enum TokenizationError {
+    NakedCarriageReturn,
+    BlockCommentStartTokenInUnquotedAtom,
+    BlockCommentEndTokenInUnquotedAtom,
+    UnexpectedEndOfBlockComment,
+    UnexpectedEofWhileInInQuotedAtom,
+    UnexpectedEofWhileInBlockComment,
+    TriedToProcessMoreDataAfterEof,
+    EofCalledMultipleTimes,
+    UnterminatedSexpCommentAtEof,
+    UnterminatedSexpCommentAtEndOfList,
+    // Called when validating and/or unsecaping raw bytes
+    EmptyRawTokenBytes,
+    UnterminatedBackslashEscape,
+    UnterminatedHexadecimalEscape,
+    UnterminatedDecimalEscape,
+    InvalidHexadecimalEscape,
+    InvalidDecimalEscape,
+    OutOfRangeDecimalEscape,
+    UnterminatedQuote,
 }
 
 impl Error {
@@ -30,8 +51,8 @@ impl From<io::Error> for Error {
     }
 }
 
-impl From<tokenizer::Error> for Error {
-    fn from(err: tokenizer::Error) -> Error {
+impl From<TokenizationError> for Error {
+    fn from(err: TokenizationError) -> Error {
         Error::TokenizationError(err)
     }
 }

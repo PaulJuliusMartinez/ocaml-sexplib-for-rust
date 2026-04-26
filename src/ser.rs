@@ -49,7 +49,7 @@ where
     Ok(String::from_utf8(vec).unwrap())
 }
 
-impl<'a, W> ser::Serializer for &'a mut Serializer<W>
+impl<W> ser::Serializer for &mut Serializer<W>
 where
     W: io::Write,
 {
@@ -271,7 +271,7 @@ impl_list_serializer!(SerializeTupleVariant, serialize_field);
 
 macro_rules! impl_key_value_pair_serializer {
     ($serializer:ident) => {
-        impl<'a, W: io::Write> ser::$serializer for &'a mut Serializer<W> {
+        impl<W: io::Write> ser::$serializer for &mut Serializer<W> {
             type Ok = ();
             type Error = Error;
 
@@ -295,7 +295,7 @@ macro_rules! impl_key_value_pair_serializer {
 impl_key_value_pair_serializer!(SerializeStruct);
 impl_key_value_pair_serializer!(SerializeStructVariant);
 
-impl<'a, W: io::Write> ser::SerializeMap for &'a mut Serializer<W> {
+impl<W: io::Write> ser::SerializeMap for &mut Serializer<W> {
     type Ok = ();
     type Error = Error;
 

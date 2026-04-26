@@ -552,7 +552,7 @@ mod tests {
 
     use insta::assert_debug_snapshot;
 
-    fn a(s: &str) -> Sexp {
+    fn a(s: &str) -> Sexp<'_> {
         Sexp::Atom(Cow::from(s))
     }
 
